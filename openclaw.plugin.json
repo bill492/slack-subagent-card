@@ -3,12 +3,11 @@
   "name": "Slack Subagent Card",
   "version": "1.0.2",
   "description": "Posts and updates a Slack Block Kit status card for thread-bound sub-agents, nudges quiet parent threads after completion, wakes parent sessions, and writes completion markers.",
-  "entry": "index.ts",
   "configSchema": {
     "type": "object",
     "properties": {
       "nudgeDelaySec": {
-        "type": "number",
+        "type": "integer",
         "minimum": 10,
         "maximum": 300,
         "default": 30,
