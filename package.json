@@ -20,7 +20,7 @@
   "author": "Unblock Labs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/unblocklabs-ai/openclaw-slack-subagent-card"
+    "url": "https://github.com/bill492/slack-subagent-card"
   },
   "engines": {
     "node": ">=22"
