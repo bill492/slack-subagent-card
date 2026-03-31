@@ -1,0 +1,35 @@
+{
+  "name": "@unblocklabs/slack-subagent-card",
+  "version": "1.0.2",
+  "description": "OpenClaw plugin: Slack Block Kit status cards for sub-agents, nudge timer, parent session wake, and completion markers.",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "slack",
+    "subagent",
+    "block-kit",
+    "notifications"
+  ],
+  "license": "MIT",
+  "author": "Unblock Labs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unblocklabs-ai/openclaw-slack-subagent-card"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.28"
+  },
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json"
+  ]
+}
