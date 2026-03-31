@@ -1,7 +1,7 @@
 {
   "id": "slack-subagent-card",
   "name": "Slack Subagent Card",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Posts and updates a Slack Block Kit status card for thread-bound sub-agents, nudges quiet parent threads after completion, wakes parent sessions, and writes completion markers.",
   "configSchema": {
     "type": "object",
