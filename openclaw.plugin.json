@@ -1,19 +1,10 @@
 {
   "id": "slack-subagent-card",
   "name": "Slack Subagent Card",
-  "version": "1.0.3",
-  "description": "Posts and updates a Slack Block Kit status card for thread-bound sub-agents, nudges quiet parent threads after completion, wakes parent sessions, and writes completion markers.",
+  "version": "1.1.0",
+  "description": "Posts and updates a Slack Block Kit status card for sub-agent work in Slack threads.",
   "configSchema": {
     "type": "object",
-    "properties": {
-      "nudgeDelaySec": {
-        "type": "integer",
-        "minimum": 10,
-        "maximum": 300,
-        "default": 30,
-        "description": "Seconds to wait after sub-agent completion before sending a nudge (default: 30)"
-      }
-    },
     "additionalProperties": false
   }
 }

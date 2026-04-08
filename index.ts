@@ -1,12 +1,8 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import type { WebClient } from "@slack/web-api";
-import { createSlackWebClient } from "openclaw/plugin-sdk/slack";
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
+import { WebClient } from "@slack/web-api";
 
-type Outcome = "ok" | "error" | "timeout" | "killed";
+type Outcome = "ok" | "error" | "timeout" | "killed" | "reset" | "deleted";
 type Mode = "run" | "session";
-type TimerHandle = ReturnType<typeof setTimeout>;
 
 type Logger = {
   debug?: (message: string, meta?: Record<string, unknown>) => void;
@@ -26,9 +22,6 @@ type HookContext = {
   requesterSessionKey?: string;
   childSessionKey?: string;
   runId?: string;
-  sessionKey?: string;
-  sessionId?: string;
-  workspaceDir?: string;
 };
 
 type SubagentSpawnedEvent = {
@@ -61,13 +54,6 @@ type SubagentDeliveryTargetEvent = {
   expectsCompletionMessage?: boolean;
 };
 
-type AgentEndEvent = {
-  success?: boolean;
-  error?: string;
-  durationMs?: number;
-  messages?: unknown[];
-};
-
 type PluginApi = {
   logger: Logger;
   config?: {
@@ -77,21 +63,8 @@ type PluginApi = {
         accounts?: Record<string, { botToken?: string }>;
       };
     };
-    plugins?: {
-      entries?: Record<string, { config?: Record<string, unknown> }>;
-    };
   };
-  pluginConfig?: Record<string, unknown>;
   registrationMode?: string;
-  runtime?: {
-    system?: {
-      requestHeartbeatNow?: (opts?: { reason?: string; sessionKey?: string }) => unknown;
-      enqueueSystemEvent?: (text: string, opts?: { sessionKey?: string; contextKey?: string }) => unknown;
-    };
-    state?: {
-      resolveStateDir?: (config?: unknown) => string;
-    };
-  };
   on: (
     hookName: string,
     handler: (event: unknown, ctx: HookContext) => void | Promise<void>,
@@ -102,18 +75,18 @@ type TrackedRun = {
   messageTs: string;
   channelId: string;
   threadTs: string;
+  accountId?: string;
   startedAt: number;
   endedAt?: number;
   label: string;
-  requesterSessionKey: string;
-  nudgeTimer?: TimerHandle;
+  mode?: Mode;
   deliveryTargetHandled?: boolean;
 };
 
 type SharedState = {
   runs: Map<string, TrackedRun>;
   registeredApis: WeakSet<object>;
-  pluginBotId?: string;
+  webClients: Map<string, WebClient>;
 };
 
 type SlackThreadTarget = {
@@ -122,21 +95,16 @@ type SlackThreadTarget = {
 };
 
 const SHARED_STATE_KEY = "__slackSubagentCardSharedState";
-const DEFAULT_NUDGE_DELAY_SEC = 30;
-const MIN_NUDGE_DELAY_SEC = 10;
-const MAX_NUDGE_DELAY_SEC = 300;
 const STALE_RUN_TTL_MS = 60 * 60 * 1000;
-const NUDGE_TEXT_PREFIX = "⏰ Sub-agent ";
 const CARD_TEXT_PREFIX = "Sub-agent ";
 const SLACK_THREAD_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^:]+):thread:(.+)$/;
 const SLACK_TOPIC_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^-]+)-topic-(.+)$/;
-const SUBAGENT_KEY_RE = /^agent:([^:]+):subagent:([0-9a-f-]+)$/;
 
 export default definePluginEntry({
   id: "slack-subagent-card",
   name: "Slack Subagent Card",
   description:
-    "Posts a Block Kit status card for thread-bound sub-agents and nudges the parent session if no follow-up appears.",
+    "Posts and updates a Slack Block Kit status card for sub-agent work in Slack threads.",
 
   register(api) {
     const pluginApi = api as unknown as PluginApi;
@@ -147,21 +115,15 @@ export default definePluginEntry({
     if (shared.registeredApis.has(api)) return;
     shared.registeredApis.add(api);
 
-    const token = resolveSlackBotToken(pluginApi);
-    if (!token) {
+    if (!hasAnySlackBotToken(pluginApi)) {
       shared.registeredApis.delete(api);
       log.warn("slack-subagent-card: no Slack bot token found; plugin disabled");
       return;
     }
 
-    const web = createSlackWebClient(token);
-
-    log.info(`slack-subagent-card: registering hooks (registrationMode=${pluginApi.registrationMode}, typeof api.on=${typeof pluginApi.on})`);
-
     pluginApi.on("subagent_spawned", async (event, ctx) => {
       try {
-        log.info(`slack-subagent-card: subagent_spawned fired — runId=${(event as SubagentSpawnedEvent).runId ?? ctx.runId} requesterSessionKey=${ctx.requesterSessionKey} threadRequested=${(event as SubagentSpawnedEvent).threadRequested} requester=${JSON.stringify((event as SubagentSpawnedEvent).requester)}`);
-        await handleSpawned(pluginApi, web, shared, event as SubagentSpawnedEvent, ctx);
+        await handleSpawned(pluginApi, shared, event as SubagentSpawnedEvent, ctx);
       } catch (error) {
         log.warn(`slack-subagent-card: subagent_spawned failed: ${stringifyError(error)}`);
       }
@@ -169,8 +131,7 @@ export default definePluginEntry({
 
     pluginApi.on("subagent_ended", async (event, ctx) => {
       try {
-        log.info(`slack-subagent-card: subagent_ended fired — runId=${(event as SubagentEndedEvent).runId ?? ctx.runId} outcome=${(event as SubagentEndedEvent).outcome}`);
-        await handleEnded(pluginApi, web, shared, event as SubagentEndedEvent, ctx);
+        await handleEnded(pluginApi, shared, event as SubagentEndedEvent, ctx);
       } catch (error) {
         log.warn(`slack-subagent-card: subagent_ended failed: ${stringifyError(error)}`);
       }
@@ -178,18 +139,9 @@ export default definePluginEntry({
 
     pluginApi.on("subagent_delivery_target", async (event, ctx) => {
       try {
-        log.info(`slack-subagent-card: subagent_delivery_target fired — runId=${(event as SubagentDeliveryTargetEvent).childRunId ?? ctx.runId}, updating card early`);
-        await handleDeliveryTarget(pluginApi, web, shared, event as SubagentDeliveryTargetEvent, ctx);
+        await handleDeliveryTarget(pluginApi, shared, event as SubagentDeliveryTargetEvent, ctx);
       } catch (error) {
         log.warn(`slack-subagent-card: subagent_delivery_target failed: ${stringifyError(error)}`);
-      }
-    });
-
-    pluginApi.on("agent_end", async (event, ctx) => {
-      try {
-        await handleAgentEnd(pluginApi, event as AgentEndEvent, ctx);
-      } catch (error) {
-        log.warn(`slack-subagent-card: agent_end failed: ${stringifyError(error)}`);
       }
     });
 
@@ -197,46 +149,8 @@ export default definePluginEntry({
   },
 });
 
-async function handleAgentEnd(api: PluginApi, event: AgentEndEvent, ctx: HookContext): Promise<void> {
-  const sessionKey = asNonEmptyString(ctx.sessionKey);
-  if (!sessionKey) return;
-
-  const match = sessionKey.match(SUBAGENT_KEY_RE);
-  if (!match) return;
-
-  const workspaceDir = asNonEmptyString(ctx.workspaceDir);
-  if (!workspaceDir) return;
-
-  const agentId = match[1];
-  const fallbackLabel = match[2];
-  const label = resolveSubagentLabel(api, agentId, sessionKey) ?? fallbackLabel;
-  const marker = {
-    label,
-    sessionKey,
-    sessionId: asNonEmptyString(ctx.sessionId) ?? "",
-    agentId,
-    completedAt: new Date().toISOString(),
-    success: Boolean(event.success),
-    error: event.error,
-    durationMs: asFiniteNumber(event.durationMs),
-    messageCount: Array.isArray(event.messages) ? event.messages.length : 0,
-  };
-
-  const resultsDir = join(workspaceDir, ".sub-agent-results");
-  const filename = `${sanitizeFilenameSegment(label)}-${Date.now()}.json`;
-
-  try {
-    mkdirSync(resultsDir, { recursive: true });
-    writeFileSync(join(resultsDir, filename), JSON.stringify(marker, null, 2));
-    api.logger.info(`slack-subagent-card: wrote completion marker ${filename}`);
-  } catch (err) {
-    api.logger.warn(`slack-subagent-card: failed to write completion marker ${filename}: ${stringifyError(err)}`);
-  }
-}
-
 async function handleSpawned(
   api: PluginApi,
-  web: WebClient,
   shared: SharedState,
   event: SubagentSpawnedEvent,
   ctx: HookContext,
@@ -246,6 +160,9 @@ async function handleSpawned(
 
   const requesterSessionKey = asNonEmptyString(ctx.requesterSessionKey);
   if (!requesterSessionKey) return;
+
+  const web = resolveSlackWebClient(api, shared, event.requester?.accountId);
+  if (!web) return;
 
   cleanupStaleRuns(shared, api.logger);
 
@@ -258,8 +175,6 @@ async function handleSpawned(
   }
 
   const label = asNonEmptyString(event.label) ?? asNonEmptyString(event.agentId) ?? runId;
-  const existing = shared.runs.get(runId);
-  if (existing?.nudgeTimer) clearTimeout(existing.nudgeTimer);
 
   const cardTitle = truncate(label, 80);
 
@@ -272,13 +187,13 @@ async function handleSpawned(
         blocks: buildBlocks({
           label: cardTitle,
           statusText: "⏳ SubAgent Running",
+          detail: buildRunningDetail(event.mode),
+          outputText: buildRunningOutput(event.mode),
           taskId: runId,
         }) as any,
       }),
     api.logger,
   );
-
-  capturePluginBotId(shared, sent);
 
   const messageTs = asNonEmptyString((sent as any)?.ts) ?? asNonEmptyString((sent as any)?.message?.ts);
   if (!messageTs) {
@@ -290,9 +205,10 @@ async function handleSpawned(
     messageTs,
     channelId: target.channelId,
     threadTs: target.threadTs,
+    accountId: asNonEmptyString(event.requester?.accountId),
     startedAt: Date.now(),
     label: cardTitle,
-    requesterSessionKey,
+    mode: event.mode,
   });
 
   api.logger.debug?.(
@@ -302,25 +218,32 @@ async function handleSpawned(
 
 async function handleDeliveryTarget(
   api: PluginApi,
-  web: WebClient,
   shared: SharedState,
   event: SubagentDeliveryTargetEvent,
   ctx: HookContext,
 ): Promise<void> {
+  if (!event.expectsCompletionMessage) return;
+
   const runId = asNonEmptyString(event.childRunId ?? ctx.runId);
   if (!runId) return;
 
   const tracked = shared.runs.get(runId);
   if (!tracked) return;
 
+  const web = resolveSlackWebClient(
+    api,
+    shared,
+    asNonEmptyString(event.requesterOrigin?.accountId) ?? tracked.accountId,
+  );
+  if (!web) return;
+
   tracked.endedAt = Date.now();
   tracked.deliveryTargetHandled = true;
-  startOrResetNudgeTimer(api, web, shared, tracked, runId, "ok");
 
   const elapsedText = formatElapsed(Math.max(0, tracked.endedAt - tracked.startedAt));
 
   try {
-    const updated = await withSlackRetry(
+    await withSlackRetry(
       () =>
         web.chat.update({
           channel: tracked.channelId,
@@ -330,14 +253,14 @@ async function handleDeliveryTarget(
             label: tracked.label,
             statusText: "✅ Completed",
             elapsedText,
-            detail: `Finished in ${elapsedText}`,
+            detail: buildCompletionDetail(elapsedText),
+            outputText: buildCompletionOutput(tracked.mode),
             outcome: "ok",
             taskId: runId,
           }) as any,
         }),
       api.logger,
     );
-    capturePluginBotId(shared, updated);
   } catch (error) {
     api.logger.warn(
       `slack-subagent-card: early completion update failed for runId=${runId}: ${stringifyError(error)}`,
@@ -347,7 +270,6 @@ async function handleDeliveryTarget(
 
 async function handleEnded(
   api: PluginApi,
-  web: WebClient,
   shared: SharedState,
   event: SubagentEndedEvent,
   ctx: HookContext,
@@ -361,18 +283,37 @@ async function handleEnded(
     return;
   }
 
+  const web = resolveSlackWebClient(api, shared, asNonEmptyString(event.accountId) ?? tracked.accountId);
+  if (!web) {
+    cleanupTrackedRun(shared, runId);
+    return;
+  }
+
   const outcome = normalizeOutcome(event.outcome);
-  if (tracked.deliveryTargetHandled && outcome === "ok") return;
+  if (tracked.deliveryTargetHandled && outcome === "ok") {
+    cleanupTrackedRun(shared, runId);
+    return;
+  }
 
   tracked.endedAt = asFiniteNumber(event.endedAt) ?? Date.now();
-  startOrResetNudgeTimer(api, web, shared, tracked, runId, outcome);
 
   const elapsedText = formatElapsed(Math.max(0, tracked.endedAt - tracked.startedAt));
   const statusText = outcomeToStatus(outcome);
-  const detail = outcome === "error" ? asNonEmptyString(event.error) : undefined;
+  const detail =
+    outcome === "error"
+      ? asNonEmptyString(event.error)
+      : outcome === "reset" || outcome === "deleted"
+        ? asNonEmptyString(event.reason)
+        : undefined;
+  const outputText = buildTerminalOutput({
+    outcome,
+    elapsedText,
+    detail,
+    mode: tracked.mode,
+  });
 
   try {
-    const updated = await withSlackRetry(
+    await withSlackRetry(
       () =>
         web.chat.update({
           channel: tracked.channelId,
@@ -382,139 +323,20 @@ async function handleEnded(
             label: tracked.label,
             statusText,
             elapsedText,
-            detail,
+            detail: buildTerminalDetail({ outcome, detail, elapsedText }),
+            outputText,
             outcome,
             taskId: runId,
           }) as any,
         }),
       api.logger,
     );
-    capturePluginBotId(shared, updated);
   } catch (error) {
     api.logger.warn(
       `slack-subagent-card: terminal card update failed for runId=${runId}: ${stringifyError(error)}`,
     );
-  }
-}
-
-function startOrResetNudgeTimer(
-  api: PluginApi,
-  web: WebClient,
-  shared: SharedState,
-  tracked: TrackedRun,
-  runId: string,
-  outcome: Outcome,
-): void {
-  if (tracked.nudgeTimer) clearTimeout(tracked.nudgeTimer);
-
-  const delayMs = resolveNudgeDelayMs(api);
-  tracked.nudgeTimer = setTimeout(() => {
-    void maybeSendNudge(api, web, shared, runId, outcome).catch((error) => {
-      api.logger.warn(`slack-subagent-card: maybeSendNudge failed for runId=${runId}: ${stringifyError(error)}`);
-    });
-  }, delayMs);
-  tracked.nudgeTimer.unref?.();
-}
-
-async function maybeSendNudge(
-  api: PluginApi,
-  web: WebClient,
-  shared: SharedState,
-  runId: string,
-  outcome: Outcome,
-): Promise<void> {
-  const tracked = shared.runs.get(runId);
-  if (!tracked) return;
-
-  try {
-    const endedAt = tracked.endedAt ?? Date.now();
-    const replies = await withSlackRetry(
-      () =>
-        web.conversations.replies({
-          channel: tracked.channelId,
-          ts: tracked.threadTs,
-          inclusive: true,
-          oldest: String(endedAt / 1000),
-          limit: 200,
-        }),
-      api.logger,
-    );
-
-    const messages = Array.isArray((replies as any)?.messages) ? ((replies as any).messages as unknown[]) : [];
-    const hasFollowUp = messages.some((message) => {
-      const tsMs = slackTsToMs((message as SlackMessage)?.ts);
-      if (tsMs === undefined || tsMs <= endedAt) return false;
-      return !isOwnPluginMessage(message as SlackMessage, tracked, shared);
-    });
-
-    if (hasFollowUp) return;
-
-    const ageText = formatElapsed(Math.max(0, Date.now() - endedAt));
-    const nudgeText = `${NUDGE_TEXT_PREFIX}*${escapeMrkdwn(tracked.label)}* finished with outcome *${outcome}* ${ageText} ago, but no response has been posted yet.`;
-
-    const posted = await withSlackRetry(
-      () =>
-        web.chat.postMessage({
-          channel: tracked.channelId,
-          thread_ts: tracked.threadTs,
-          text: nudgeText,
-        }),
-      api.logger,
-    );
-
-    capturePluginBotId(shared, posted);
-    wakeParentSession(api, tracked, runId, outcome);
-    api.logger.info(`slack-subagent-card: nudge posted for runId=${runId}`);
   } finally {
     cleanupTrackedRun(shared, runId);
-  }
-}
-
-type SlackMessage = {
-  ts?: string;
-  text?: string;
-  bot_id?: string;
-  app_id?: string;
-  subtype?: string;
-  is_bot?: boolean;
-  blocks?: Array<{ type?: string }>;
-};
-
-function isOwnPluginMessage(message: SlackMessage, tracked: TrackedRun, _shared: SharedState): boolean {
-  if (asNonEmptyString(message.ts) === tracked.messageTs) return true;
-
-  const text = asNonEmptyString(message.text) ?? "";
-  if (text.startsWith(NUDGE_TEXT_PREFIX)) return true;
-
-  const hasPlanBlock = Array.isArray(message.blocks) && message.blocks.some((block) => block?.type === "plan");
-  if (hasPlanBlock && text.startsWith(`${CARD_TEXT_PREFIX}${tracked.label}:`)) return true;
-
-  return false;
-}
-
-function wakeParentSession(api: PluginApi, tracked: TrackedRun, runId: string, outcome: Outcome): void {
-  const sessionKey = tracked.requesterSessionKey;
-  const contextKey = `slack-subagent-card:${runId}:pending-result`;
-  const eventText =
-    `WAKE UP — sub-agent "${tracked.label}" finished (outcome: ${outcome}). ` +
-    `This is NOT a heartbeat. Do NOT reply HEARTBEAT_OK. ` +
-    `You have a pending sub-agent result that needs to be delivered to the user. ` +
-    `Your normal reply will NOT reach Slack because this wake has no inbound delivery context. ` +
-    `You MUST use the message tool to post your response: ` +
-    `message(action="send", channel="slack", target="${tracked.channelId}", ` +
-    `threadId="${tracked.threadTs}", message="<your response>"). ` +
-    `Check sessions_history or .sub-agent-results for the sub-agent output first.`;
-
-  try {
-    api.runtime?.system?.enqueueSystemEvent?.(eventText, { sessionKey, contextKey });
-  } catch (error) {
-    api.logger.warn(`slack-subagent-card: enqueueSystemEvent failed: ${stringifyError(error)}`);
-  }
-
-  try {
-    api.runtime?.system?.requestHeartbeatNow?.({ sessionKey, reason: contextKey });
-  } catch (error) {
-    api.logger.debug?.(`slack-subagent-card: requestHeartbeatNow failed: ${stringifyError(error)}`);
   }
 }
 
@@ -523,12 +345,15 @@ function buildBlocks(params: {
   statusText: string;
   elapsedText?: string;
   detail?: string;
+  outputText?: string;
   outcome?: Outcome;
   taskId?: string;
 }): Array<Record<string, unknown>> {
   let taskStatus = "in_progress";
   if (params.outcome === "ok") taskStatus = "complete";
   else if (params.outcome === "error" || params.outcome === "timeout" || params.outcome === "killed") {
+    taskStatus = "failed";
+  } else if (params.outcome === "reset" || params.outcome === "deleted") {
     taskStatus = "failed";
   }
 
@@ -542,15 +367,11 @@ function buildBlocks(params: {
   };
 
   if (params.detail) {
-    task.output = {
-      type: "rich_text",
-      elements: [
-        {
-          type: "rich_text_section",
-          elements: [{ type: "text", text: truncate(params.detail, 300) }],
-        },
-      ],
-    };
+    task.details = toRichText(truncate(params.detail, 300));
+  }
+
+  if (params.outputText) {
+    task.output = toRichText(truncate(params.outputText, 300));
   }
 
   return [
@@ -560,6 +381,85 @@ function buildBlocks(params: {
       tasks: [task],
     },
   ];
+}
+
+function buildRunningDetail(mode?: Mode): string {
+  return mode === "session"
+    ? "A persistent background worker session is active for this task."
+    : "A background worker is actively gathering results for this task.";
+}
+
+function buildRunningOutput(mode?: Mode): string {
+  return mode === "session"
+    ? "You can keep chatting here while the worker session continues in the background."
+    : "The main agent can keep helping here while this background run works in parallel.";
+}
+
+function buildCompletionDetail(elapsedText: string): string {
+  return `Finished background work in ${elapsedText} and handed the result back to the parent agent.`;
+}
+
+function buildCompletionOutput(mode?: Mode): string {
+  return mode === "session"
+    ? "The parent agent can now review the result, continue the workflow, or reply in this thread."
+    : "The parent agent can now review the finished run, continue the workflow, or reply in this thread.";
+}
+
+function buildTerminalDetail(params: {
+  outcome: Outcome;
+  detail?: string;
+  elapsedText: string;
+}): string {
+  if (params.detail) return params.detail;
+
+  switch (params.outcome) {
+    case "timeout":
+      return `The sub-agent stopped after ${params.elapsedText} because it hit its time limit.`;
+    case "killed":
+      return `The sub-agent was stopped after ${params.elapsedText}.`;
+    case "reset":
+      return `The sub-agent session was reset after ${params.elapsedText}.`;
+    case "deleted":
+      return `The sub-agent session was deleted after ${params.elapsedText}.`;
+    case "error":
+      return `The sub-agent failed after ${params.elapsedText}.`;
+    case "ok":
+      return buildCompletionDetail(params.elapsedText);
+  }
+}
+
+function buildTerminalOutput(params: {
+  outcome: Outcome;
+  elapsedText: string;
+  detail?: string;
+  mode?: Mode;
+}): string | undefined {
+  switch (params.outcome) {
+    case "ok":
+      return buildCompletionOutput(params.mode);
+    case "error":
+      return "The parent agent can inspect the failure, retry, or choose a different next step.";
+    case "timeout":
+      return "The parent agent can retry the task, break it into smaller steps, or continue with another approach.";
+    case "killed":
+      return "The parent agent can decide whether to restart the work or continue without it.";
+    case "reset":
+      return "The parent agent can recreate the worker session if this task still needs to continue.";
+    case "deleted":
+      return "The parent agent can start a new worker if the task still needs background processing.";
+  }
+}
+
+function toRichText(text: string): Record<string, unknown> {
+  return {
+    type: "rich_text",
+    elements: [
+      {
+        type: "rich_text_section",
+        elements: [{ type: "text", text }],
+      },
+    ],
+  };
 }
 
 function outcomeToStatus(outcome: Outcome): string {
@@ -572,11 +472,21 @@ function outcomeToStatus(outcome: Outcome): string {
       return "⏱️ Timed out";
     case "killed":
       return "🔪 Killed";
+    case "reset":
+      return "↩️ Reset";
+    case "deleted":
+      return "🗑️ Deleted";
   }
 }
 
 function normalizeOutcome(value: unknown): Outcome {
-  return value === "error" || value === "timeout" || value === "killed" ? value : "ok";
+  return value === "error" ||
+    value === "timeout" ||
+    value === "killed" ||
+    value === "reset" ||
+    value === "deleted"
+    ? value
+    : "ok";
 }
 
 async function resolveSlackThreadTarget(
@@ -635,62 +545,46 @@ function stripSlackTargetPrefix(value: string): string {
   return value.replace(/^(channel:|room:)/i, "");
 }
 
-function resolveSlackBotToken(api: PluginApi): string | undefined {
+function hasAnySlackBotToken(api: PluginApi): boolean {
+  return Boolean(
+    asNonEmptyString(api.config?.channels?.slack?.botToken) ??
+      asNonEmptyString(api.config?.channels?.slack?.accounts?.default?.botToken) ??
+      Object.values(api.config?.channels?.slack?.accounts ?? {}).find((account) =>
+        asNonEmptyString(account?.botToken),
+      )?.botToken ??
+      asNonEmptyString(process.env.SLACK_BOT_TOKEN),
+  );
+}
+
+function resolveSlackBotToken(api: PluginApi, accountId?: string): string | undefined {
+  const normalizedAccountId = asNonEmptyString(accountId);
   return (
+    (normalizedAccountId
+      ? asNonEmptyString(api.config?.channels?.slack?.accounts?.[normalizedAccountId]?.botToken)
+      : undefined) ??
     asNonEmptyString(api.config?.channels?.slack?.botToken) ??
     asNonEmptyString(api.config?.channels?.slack?.accounts?.default?.botToken) ??
     asNonEmptyString(process.env.SLACK_BOT_TOKEN)
   );
 }
 
-function resolveSubagentLabel(api: PluginApi, agentId: string, sessionKey: string): string | undefined {
-  try {
-    const stateDir = api.runtime?.state?.resolveStateDir?.(api.config);
-    if (!stateDir) return undefined;
-
-    const sessionsPath = join(stateDir, "agents", agentId, "sessions", "sessions.json");
-    const sessions = JSON.parse(readFileSync(sessionsPath, "utf-8")) as Record<string, { label?: unknown }>;
-    return asNonEmptyString(sessions?.[sessionKey]?.label);
-  } catch {
+function resolveSlackWebClient(
+  api: PluginApi,
+  shared: SharedState,
+  accountId?: string,
+): WebClient | undefined {
+  const token = resolveSlackBotToken(api, accountId);
+  if (!token) {
+    api.logger.warn(
+      `slack-subagent-card: no Slack bot token found for accountId=${accountId ?? "default"}; skipping`,
+    );
     return undefined;
   }
-}
-
-function resolveNudgeDelayMs(api: PluginApi): number {
-  // Check plugin config (api.pluginConfig.nudgeDelaySec)
-  const fromPluginConfig = asFiniteNumber((api.pluginConfig as any)?.nudgeDelaySec);
-  if (fromPluginConfig !== undefined) {
-    const clamped = Math.max(MIN_NUDGE_DELAY_SEC, Math.min(MAX_NUDGE_DELAY_SEC, fromPluginConfig));
-    return clamped * 1000;
-  }
-
-  // Legacy: check plugins.entries.slack-subagent-card.config.nudgeDelaySec
-  const fromEntries = asFiniteNumber(
-    api.config?.plugins?.entries?.["slack-subagent-card"]?.config?.nudgeDelaySec
-  );
-  if (fromEntries !== undefined) {
-    const clamped = Math.max(MIN_NUDGE_DELAY_SEC, Math.min(MAX_NUDGE_DELAY_SEC, fromEntries));
-    return clamped * 1000;
-  }
-
-  // Env var fallback
-  const fromEnv = asFiniteNumber(process.env.SUBAGENT_NUDGE_DELAY_SEC);
-  if (fromEnv !== undefined) {
-    const clamped = Math.max(MIN_NUDGE_DELAY_SEC, Math.min(MAX_NUDGE_DELAY_SEC, fromEnv));
-    return clamped * 1000;
-  }
-
-  return DEFAULT_NUDGE_DELAY_SEC * 1000;
-}
-
-function sanitizeFilenameSegment(value: string): string {
-  const cleaned = value
-    .trim()
-    .replace(/[^a-z0-9._-]+/gi, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-
-  return cleaned || "subagent";
+  const cached = shared.webClients.get(token);
+  if (cached) return cached;
+  const client = new WebClient(token);
+  shared.webClients.set(token, client);
+  return client;
 }
 
 async function withSlackRetry<T>(
@@ -722,13 +616,6 @@ function getRetryAfterSeconds(error: unknown): number | undefined {
   return retryAfter && retryAfter > 0 ? retryAfter : undefined;
 }
 
-function slackTsToMs(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value * 1000;
-  if (typeof value !== "string" || !value.trim()) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed * 1000 : undefined;
-}
-
 function formatElapsed(ms: number): string {
   if (ms < 1000) return "just now";
   const totalSeconds = Math.floor(ms / 1000);
@@ -743,14 +630,6 @@ function formatElapsed(ms: number): string {
 
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
-}
-
-function escapeMrkdwn(value: string): string {
-  return value.replace(/[&<>]/g, (ch) => {
-    if (ch === "&") return "&amp;";
-    if (ch === "<") return "&lt;";
-    return "&gt;";
-  });
 }
 
 function normalizeSlackChannelId(channelId: string): string {
@@ -792,28 +671,13 @@ function cleanupStaleRuns(shared: SharedState, log: Logger): void {
   const cutoff = Date.now() - STALE_RUN_TTL_MS;
   for (const [runId, tracked] of shared.runs.entries()) {
     if (tracked.startedAt >= cutoff) continue;
-    if (tracked.nudgeTimer) clearTimeout(tracked.nudgeTimer);
     shared.runs.delete(runId);
     log.debug?.(`slack-subagent-card: swept stale tracked runId=${runId}`);
   }
 }
 
 function cleanupTrackedRun(shared: SharedState, runId: string): void {
-  const tracked = shared.runs.get(runId);
-  if (tracked?.nudgeTimer) clearTimeout(tracked.nudgeTimer);
   shared.runs.delete(runId);
-}
-
-function capturePluginBotId(shared: SharedState, response: unknown): void {
-  const record = asRecord(response);
-  const message = asRecord(record?.message);
-  const botId =
-    asNonEmptyString(record?.bot_id) ??
-    asNonEmptyString(message?.bot_id) ??
-    asNonEmptyString(message?.botId) ??
-    asNonEmptyString(record?.botId);
-
-  if (botId) shared.pluginBotId = botId;
 }
 
 function getSharedState(): SharedState {
@@ -825,6 +689,7 @@ function getSharedState(): SharedState {
     scope[SHARED_STATE_KEY] = {
       runs: new Map(),
       registeredApis: new WeakSet(),
+      webClients: new Map(),
     };
   }
 
