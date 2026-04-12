@@ -1,3 +1,7 @@
+import {
+  resolveConfiguredSecretInputWithFallback,
+  type OpenClawConfig,
+} from "openclaw/plugin-sdk/config-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { WebClient } from "@slack/web-api";
 
@@ -56,14 +60,7 @@ type SubagentDeliveryTargetEvent = {
 
 type PluginApi = {
   logger: Logger;
-  config?: {
-    channels?: {
-      slack?: {
-        botToken?: string;
-        accounts?: Record<string, { botToken?: string }>;
-      };
-    };
-  };
+  config?: OpenClawConfig;
   registrationMode?: string;
   on: (
     hookName: string,
@@ -115,12 +112,6 @@ export default definePluginEntry({
     if (shared.registeredApis.has(api)) return;
     shared.registeredApis.add(api);
 
-    if (!hasAnySlackBotToken(pluginApi)) {
-      shared.registeredApis.delete(api);
-      log.warn("slack-subagent-card: no Slack bot token found; plugin disabled");
-      return;
-    }
-
     pluginApi.on("subagent_spawned", async (event, ctx) => {
       try {
         await handleSpawned(pluginApi, shared, event as SubagentSpawnedEvent, ctx);
@@ -161,7 +152,9 @@ async function handleSpawned(
   const requesterSessionKey = asNonEmptyString(ctx.requesterSessionKey);
   if (!requesterSessionKey) return;
 
-  const web = resolveSlackWebClient(api, shared, event.requester?.accountId);
+  if (!hasSlackThreadTargetHint(requesterSessionKey, event.requester)) return;
+
+  const web = await resolveSlackWebClient(api, shared, event.requester?.accountId);
   if (!web) return;
 
   cleanupStaleRuns(shared, api.logger);
@@ -230,7 +223,7 @@ async function handleDeliveryTarget(
   const tracked = shared.runs.get(runId);
   if (!tracked) return;
 
-  const web = resolveSlackWebClient(
+  const web = await resolveSlackWebClient(
     api,
     shared,
     asNonEmptyString(event.requesterOrigin?.accountId) ?? tracked.accountId,
@@ -283,7 +276,11 @@ async function handleEnded(
     return;
   }
 
-  const web = resolveSlackWebClient(api, shared, asNonEmptyString(event.accountId) ?? tracked.accountId);
+  const web = await resolveSlackWebClient(
+    api,
+    shared,
+    asNonEmptyString(event.accountId) ?? tracked.accountId,
+  );
   if (!web) {
     cleanupTrackedRun(shared, runId);
     return;
@@ -545,38 +542,97 @@ function stripSlackTargetPrefix(value: string): string {
   return value.replace(/^(channel:|room:)/i, "");
 }
 
-function hasAnySlackBotToken(api: PluginApi): boolean {
-  return Boolean(
-    asNonEmptyString(api.config?.channels?.slack?.botToken) ??
-      asNonEmptyString(api.config?.channels?.slack?.accounts?.default?.botToken) ??
-      Object.values(api.config?.channels?.slack?.accounts ?? {}).find((account) =>
-        asNonEmptyString(account?.botToken),
-      )?.botToken ??
-      asNonEmptyString(process.env.SLACK_BOT_TOKEN),
-  );
+function hasSlackThreadTargetHint(
+  requesterSessionKey: string,
+  requester: SlackRequester | undefined,
+): boolean {
+  if (parseSlackThreadSessionKey(requesterSessionKey)) return true;
+  return Boolean(asNonEmptyString(requester?.to) && asNonEmptyString(requester?.threadId));
 }
 
-function resolveSlackBotToken(api: PluginApi, accountId?: string): string | undefined {
+type SlackTokenResolution = {
+  token?: string;
+  unresolvedReasons: string[];
+};
+
+async function resolveSlackBotToken(
+  api: PluginApi,
+  accountId?: string,
+): Promise<SlackTokenResolution> {
   const normalizedAccountId = asNonEmptyString(accountId);
-  return (
-    (normalizedAccountId
-      ? asNonEmptyString(api.config?.channels?.slack?.accounts?.[normalizedAccountId]?.botToken)
-      : undefined) ??
-    asNonEmptyString(api.config?.channels?.slack?.botToken) ??
-    asNonEmptyString(api.config?.channels?.slack?.accounts?.default?.botToken) ??
-    asNonEmptyString(process.env.SLACK_BOT_TOKEN)
-  );
+  const config = api.config;
+  const unresolvedReasons: string[] = [];
+
+  for (const candidate of buildSlackBotTokenCandidates(config, normalizedAccountId)) {
+    const resolved = await resolveSlackBotTokenCandidate(api, candidate.value, candidate.path);
+    if (resolved.token) {
+      return { token: resolved.token, unresolvedReasons };
+    }
+    if (resolved.unresolvedReason) {
+      unresolvedReasons.push(resolved.unresolvedReason);
+    }
+  }
+
+  return {
+    token: asNonEmptyString(process.env.SLACK_BOT_TOKEN),
+    unresolvedReasons,
+  };
 }
 
-function resolveSlackWebClient(
+function buildSlackBotTokenCandidates(config: OpenClawConfig | undefined, accountId?: string) {
+  const candidates: Array<{ path: string; value: unknown }> = [];
+  if (accountId) {
+    candidates.push({
+      path: `channels.slack.accounts.${accountId}.botToken`,
+      value: config?.channels?.slack?.accounts?.[accountId]?.botToken,
+    });
+  }
+  candidates.push(
+    {
+      path: "channels.slack.botToken",
+      value: config?.channels?.slack?.botToken,
+    },
+    {
+      path: "channels.slack.accounts.default.botToken",
+      value: config?.channels?.slack?.accounts?.default?.botToken,
+    },
+  );
+  return candidates;
+}
+
+async function resolveSlackBotTokenCandidate(
+  api: PluginApi,
+  value: unknown,
+  path: string,
+): Promise<{ token?: string; unresolvedReason?: string }> {
+  if (!api.config) {
+    return { token: asNonEmptyString(value) };
+  }
+
+  const resolved = await resolveConfiguredSecretInputWithFallback({
+    config: api.config,
+    env: process.env,
+    value,
+    path,
+  });
+
+  return {
+    token: resolved.value,
+    unresolvedReason: resolved.unresolvedRefReason,
+  };
+}
+
+async function resolveSlackWebClient(
   api: PluginApi,
   shared: SharedState,
   accountId?: string,
-): WebClient | undefined {
-  const token = resolveSlackBotToken(api, accountId);
+): Promise<WebClient | undefined> {
+  const { token, unresolvedReasons } = await resolveSlackBotToken(api, accountId);
   if (!token) {
+    const unresolvedSuffix =
+      unresolvedReasons.length > 0 ? ` unresolvedRefs=${unresolvedReasons.join(" | ")}` : "";
     api.logger.warn(
-      `slack-subagent-card: no Slack bot token found for accountId=${accountId ?? "default"}; skipping`,
+      `slack-subagent-card: no Slack bot token found for accountId=${accountId ?? "default"}; skipping${unresolvedSuffix}`,
     );
     return undefined;
   }
