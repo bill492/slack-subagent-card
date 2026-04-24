@@ -6,9 +6,9 @@ This plugin posts a Block Kit `plan` card into the originating Slack thread when
 
 ## Version
 
-Current release candidate: **1.2.0**.
+Current release candidate: **1.2.1**.
 
-Version `1.2.0` adds safer task-summary rendering, stronger lifecycle ordering, handler-level regression tests, and cleaner packaging for OpenClaw plugin distribution.
+Version `1.2.1` adds safer task-summary rendering, stronger lifecycle ordering, handler-level regression tests, and cleaner packaging for OpenClaw plugin distribution.
 
 ## Current Phase
 

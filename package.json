@@ -1,6 +1,6 @@
 {
   "name": "@unblocklabs/slack-subagent-card",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "OpenClaw plugin: Slack Block Kit status cards for sub-agent work in Slack threads.",
   "type": "module",
   "scripts": {
@@ -49,7 +49,7 @@
   "author": "Unblock Labs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bill492/slack-subagent-card"
+    "url": "git+https://github.com/bill492/slack-subagent-card.git"
   },
   "engines": {
     "node": ">=22"
