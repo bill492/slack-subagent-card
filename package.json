@@ -1,28 +1,40 @@
 {
   "name": "@unblocklabs/slack-subagent-card",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "OpenClaw plugin: Slack Block Kit status cards for sub-agent work in Slack threads.",
   "type": "module",
+  "scripts": {
+    "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test task-card.test.mjs index.test.mjs",
+    "prepack": "npm run build"
+  },
   "dependencies": {
     "@slack/web-api": "^7.15.0"
   },
   "devDependencies": {
-    "openclaw": ">=2026.4.5"
+    "@types/node": "^22.0.0",
+    "openclaw": ">=2026.4.24",
+    "typescript": "^5.9.0"
   },
   "openclaw": {
     "extensions": [
       "./index.ts"
     ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
     "install": {
-      "minHostVersion": ">=2026.4.5"
+      "minHostVersion": ">=2026.4.24"
     },
     "compat": {
-      "pluginApi": ">=2026.4.5",
-      "minGatewayVersion": ">=2026.4.5"
+      "pluginApi": ">=2026.4.24",
+      "minGatewayVersion": ">=2026.4.24"
     },
     "build": {
-      "openclawVersion": "2026.4.5",
-      "pluginSdkVersion": "2026.4.5"
+      "openclawVersion": "2026.4.24",
+      "pluginSdkVersion": "2026.4.24"
     }
   },
   "keywords": [
@@ -43,7 +55,7 @@
     "node": ">=22"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.4.5"
+    "openclaw": ">=2026.4.24"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -52,6 +64,10 @@
   },
   "files": [
     "index.ts",
+    "plugin-handlers.ts",
+    "task-card.ts",
+    "task-text-sanitizer.ts",
+    "dist/",
     "openclaw.plugin.json"
   ]
 }
