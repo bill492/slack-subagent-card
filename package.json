@@ -7,6 +7,7 @@
     "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
+    "release": "bash ./scripts/release.sh",
     "test": "npm run build && node --test task-card.test.mjs index.test.mjs",
     "prepack": "npm run build"
   },

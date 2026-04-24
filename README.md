@@ -93,10 +93,21 @@ Raw runtime fields such as `progressSummary`, `terminalSummary`, and `error` are
 Run the local validation suite:
 
 ```sh
+npm run check
 npm test
 ```
 
 The test suite builds the TypeScript output and runs handler-level lifecycle tests plus task-card rendering tests.
+
+## Releasing
+
+Use the scripted release flow:
+
+```sh
+npm run release -- X.Y.Z
+```
+
+Release guidance and guardrails live in [RELEASING.md](./RELEASING.md).
 
 ## Limitations
 
