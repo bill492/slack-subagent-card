@@ -1,3 +1,8 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { WebClient } from "@slack/web-api";
+
 import {
   BLOCK_TEXT_MAX_CHARS,
   buildRunningContent,
@@ -10,6 +15,8 @@ import {
 } from "./task-card.js";
 
 export type OpenClawConfig = {
+  botToken?: unknown;
+  accounts?: Record<string, { botToken?: unknown }>;
   channels?: {
     slack?: {
       botToken?: unknown;
@@ -23,7 +30,12 @@ type SecretResolver = (params: {
   env: NodeJS.ProcessEnv;
   value: unknown;
   path: string;
-}) => Promise<{ value?: string; unresolvedRefReason?: string }>;
+}) => Promise<{
+  value?: string;
+  source?: "config" | "secretRef" | "fallback";
+  unresolvedRefReason?: string;
+  secretRefConfigured?: boolean;
+}>;
 
 type SlackWebClient = {
   chat: {
@@ -99,6 +111,7 @@ export type PluginApi = {
   logger: Logger;
   config?: OpenClawConfig;
   createSlackWebClient?: (token: string) => SlackWebClient;
+  fallbackSlackWebClientFactory?: (token: string) => SlackWebClient;
   resolveConfiguredSecretInputWithFallback?: SecretResolver;
   runtime?: {
     tasks?: PluginRuntimeTasks;
@@ -156,6 +169,11 @@ export function registerSlackSubagentCardHandlers(api: PluginApi, shared: Shared
 
   api.on("subagent_spawned", async (event, ctx) => {
     try {
+      const spawned = event as SubagentSpawnedEvent;
+      const runId = asNonEmptyString(spawned.runId ?? ctx.runId) ?? "unknown";
+      log.info(
+        `slack-subagent-card: subagent_spawned fired — runId=${runId} requesterSessionKey=${asNonEmptyString(ctx.requesterSessionKey) ?? "none"} threadRequested=${String(spawned.threadRequested ?? false)} requester=${summarizeRequester(spawned.requester)}`,
+      );
       await handleSpawned(api, shared, event as SubagentSpawnedEvent, ctx);
     } catch (error) {
       log.warn(`slack-subagent-card: subagent_spawned failed: ${stringifyError(error)}`);
@@ -164,6 +182,11 @@ export function registerSlackSubagentCardHandlers(api: PluginApi, shared: Shared
 
   api.on("subagent_ended", async (event, ctx) => {
     try {
+      const ended = event as SubagentEndedEvent;
+      const runId = asNonEmptyString(ended.runId ?? ctx.runId) ?? "unknown";
+      log.info(
+        `slack-subagent-card: subagent_ended fired — runId=${runId} outcome=${normalizeOutcome(ended.outcome)} accountId=${asNonEmptyString(ended.accountId) ?? "default"} requesterSessionKey=${asNonEmptyString(ctx.requesterSessionKey) ?? "none"}`,
+      );
       await handleEnded(api, shared, event as SubagentEndedEvent, ctx);
     } catch (error) {
       log.warn(`slack-subagent-card: subagent_ended failed: ${stringifyError(error)}`);
@@ -171,6 +194,11 @@ export function registerSlackSubagentCardHandlers(api: PluginApi, shared: Shared
   });
 
   api.on("subagent_delivery_target", (event, ctx) => {
+    const delivery = event as SubagentDeliveryTargetEvent;
+    const runId = asNonEmptyString(delivery.childRunId ?? ctx.runId) ?? "unknown";
+    log.info(
+      `slack-subagent-card: subagent_delivery_target fired — runId=${runId} requesterSessionKey=${asNonEmptyString(delivery.requesterSessionKey) ?? asNonEmptyString(ctx.requesterSessionKey) ?? "none"} expectsCompletionMessage=${String(Boolean(delivery.expectsCompletionMessage))} requester=${summarizeRequester(delivery.requesterOrigin)}`,
+    );
     void handleDeliveryTarget(api, shared, event as SubagentDeliveryTargetEvent, ctx).catch((error) => {
       log.warn(`slack-subagent-card: subagent_delivery_target failed: ${stringifyError(error)}`);
     });
@@ -186,12 +214,23 @@ export async function handleSpawned(
   ctx: HookContext,
 ): Promise<void> {
   const runId = asNonEmptyString(event.runId ?? ctx.runId);
-  if (!runId) return;
+  if (!runId) {
+    api.logger.debug?.("slack-subagent-card: handleSpawned skipped because runId is missing");
+    return;
+  }
 
   const requesterSessionKey = asNonEmptyString(ctx.requesterSessionKey);
-  if (!requesterSessionKey) return;
+  if (!requesterSessionKey) {
+    api.logger.debug?.(`slack-subagent-card: handleSpawned skipped because requesterSessionKey is missing for runId=${runId}`);
+    return;
+  }
 
-  if (!hasSlackThreadTargetHint(requesterSessionKey, event.requester)) return;
+  if (!hasSlackThreadTargetHint(requesterSessionKey, event.requester)) {
+    api.logger.debug?.(
+      `slack-subagent-card: handleSpawned skipped because no Slack thread target hint was found for runId=${runId} requesterSessionKey=${requesterSessionKey} requester=${summarizeRequester(event.requester)}`,
+    );
+    return;
+  }
 
   const web = await resolveSlackWebClient(api, shared, event.requester?.accountId);
   if (!web) return;
@@ -272,7 +311,10 @@ export async function handleDeliveryTarget(
   if (!event.expectsCompletionMessage) return;
 
   const runId = asNonEmptyString(event.childRunId ?? ctx.runId);
-  if (!runId) return;
+  if (!runId) {
+    api.logger.debug?.("slack-subagent-card: handleDeliveryTarget skipped because runId is missing");
+    return;
+  }
 
   const tracked = shared.runs.get(runId);
   if (!tracked) {
@@ -414,7 +456,10 @@ export async function handleEnded(
   ctx: HookContext,
 ): Promise<void> {
   const runId = asNonEmptyString(event.runId ?? ctx.runId);
-  if (!runId) return;
+  if (!runId) {
+    api.logger.debug?.("slack-subagent-card: handleEnded skipped because runId is missing");
+    return;
+  }
 
   const tracked = shared.runs.get(runId);
   if (!tracked) {
@@ -536,6 +581,9 @@ async function postSlackTaskCard(params: {
     slackTaskStatus: SlackTaskStatus;
   };
 }): Promise<string | undefined> {
+  params.logger.debug?.(
+    `slack-subagent-card: posting card channel=${params.target.channelId} thread=${params.target.threadTs} taskId=${params.content.taskId} status=${params.content.slackTaskStatus} detailLen=${params.content.detail.length} outputLen=${params.content.outputText?.length ?? 0}`,
+  );
   const sent = await withSlackRetry(
     () =>
       params.web.chat.postMessage({
@@ -571,6 +619,9 @@ async function updateSlackTaskCard(params: {
   };
   elapsedText?: string;
 }): Promise<void> {
+  params.logger.debug?.(
+    `slack-subagent-card: updating card channel=${params.tracked.channelId} ts=${params.tracked.messageTs} taskId=${params.content.taskId} status=${params.content.slackTaskStatus} detailLen=${params.content.detail.length} outputLen=${params.content.outputText?.length ?? 0}`,
+  );
   await withSlackRetry(
     () =>
       params.web.chat.update({
@@ -783,7 +834,19 @@ function hasSlackThreadTargetHint(
 
 type SlackTokenResolution = {
   token?: string;
+  diagnostics: string[];
   unresolvedReasons: string[];
+};
+
+type SlackBotTokenCandidate = {
+  path: string;
+  value: unknown;
+};
+
+type SlackBotTokenCandidateResolution = {
+  token?: string;
+  source?: "config" | "secretRef" | "fallback";
+  unresolvedReason?: string;
 };
 
 async function resolveSlackBotToken(
@@ -792,33 +855,77 @@ async function resolveSlackBotToken(
 ): Promise<SlackTokenResolution> {
   const normalizedAccountId = asNonEmptyString(accountId);
   const config = api.config;
+  const diagnostics: string[] = [];
   const unresolvedReasons: string[] = [];
 
   for (const candidate of buildSlackBotTokenCandidates(config, normalizedAccountId)) {
-    const resolved = await resolveSlackBotTokenCandidate(api, candidate.value, candidate.path);
+    const resolved = await resolveSlackBotTokenCandidate(api, config, candidate.value, candidate.path);
+    diagnostics.push(formatTokenCandidateDiagnostic(candidate, resolved));
     if (resolved.token) {
-      return { token: resolved.token, unresolvedReasons };
+      api.logger.info(
+        `slack-subagent-card: resolved Slack bot token for accountId=${normalizedAccountId ?? "default"} via ${candidate.path} (${summarizeResolvedToken(resolved.token)} source=${resolved.source ?? "config"})`,
+      );
+      return { token: resolved.token, diagnostics, unresolvedReasons };
     }
     if (resolved.unresolvedReason) {
       unresolvedReasons.push(resolved.unresolvedReason);
     }
   }
 
+  const envToken = asNonEmptyString(process.env.SLACK_BOT_TOKEN);
+  diagnostics.push(
+    envToken
+      ? `env.SLACK_BOT_TOKEN(input=present resolved=${summarizeResolvedToken(envToken)} source=env)`
+      : "env.SLACK_BOT_TOKEN(input=missing resolved=missing)",
+  );
+  if (envToken) {
+    api.logger.info(
+      `slack-subagent-card: resolved Slack bot token for accountId=${normalizedAccountId ?? "default"} via env.SLACK_BOT_TOKEN (${summarizeResolvedToken(envToken)} source=env)`,
+    );
+    return { token: envToken, diagnostics, unresolvedReasons };
+  }
+
+  const diskFallback = await resolveSlackBotTokenFromLocalConfig(api, normalizedAccountId);
+  diagnostics.push(...diskFallback.diagnostics);
+  unresolvedReasons.push(...diskFallback.unresolvedReasons);
+  if (diskFallback.token) {
+    api.logger.warn(
+      `slack-subagent-card: using local config fallback for accountId=${normalizedAccountId ?? "default"} via ${diskFallback.path ?? "unknown"} (${summarizeResolvedToken(diskFallback.token)})`,
+    );
+    return {
+      token: diskFallback.token,
+      diagnostics,
+      unresolvedReasons,
+    };
+  }
+
   return {
-    token: asNonEmptyString(process.env.SLACK_BOT_TOKEN),
+    diagnostics,
     unresolvedReasons,
   };
 }
 
 function buildSlackBotTokenCandidates(config: OpenClawConfig | undefined, accountId?: string) {
-  const candidates: Array<{ path: string; value: unknown }> = [];
+  const candidates: SlackBotTokenCandidate[] = [];
   if (accountId) {
+    candidates.push({
+      path: `accounts.${accountId}.botToken`,
+      value: config?.accounts?.[accountId]?.botToken,
+    });
     candidates.push({
       path: `channels.slack.accounts.${accountId}.botToken`,
       value: config?.channels?.slack?.accounts?.[accountId]?.botToken,
     });
   }
   candidates.push(
+    {
+      path: "botToken",
+      value: config?.botToken,
+    },
+    {
+      path: "accounts.default.botToken",
+      value: config?.accounts?.default?.botToken,
+    },
     {
       path: "channels.slack.botToken",
       value: config?.channels?.slack?.botToken,
@@ -833,19 +940,27 @@ function buildSlackBotTokenCandidates(config: OpenClawConfig | undefined, accoun
 
 async function resolveSlackBotTokenCandidate(
   api: PluginApi,
+  config: OpenClawConfig | undefined,
   value: unknown,
   path: string,
-): Promise<{ token?: string; unresolvedReason?: string }> {
-  if (!api.config) {
-    return { token: asNonEmptyString(value) };
+): Promise<SlackBotTokenCandidateResolution> {
+  const directToken = asDirectPlaintextSecret(value);
+  if (directToken) {
+    return { token: directToken, source: "config" };
+  }
+
+  if (!config) {
+    const token = asNonEmptyString(value);
+    return { token, source: token ? "config" : undefined };
   }
 
   if (!api.resolveConfiguredSecretInputWithFallback) {
-    return { token: asNonEmptyString(value) };
+    const token = asNonEmptyString(value);
+    return { token, source: token ? "config" : undefined };
   }
 
   const resolved = await api.resolveConfiguredSecretInputWithFallback({
-    config: api.config,
+    config,
     env: process.env,
     value,
     path,
@@ -853,6 +968,7 @@ async function resolveSlackBotTokenCandidate(
 
   return {
     token: asNonEmptyString(resolved?.value),
+    source: resolved?.source,
     unresolvedReason: asNonEmptyString(resolved?.unresolvedRefReason),
   };
 }
@@ -862,18 +978,23 @@ async function resolveSlackWebClient(
   shared: SharedState,
   accountId?: string,
 ): Promise<SlackWebClient | undefined> {
-  const { token, unresolvedReasons } = await resolveSlackBotToken(api, accountId);
+  const { token, diagnostics, unresolvedReasons } = await resolveSlackBotToken(api, accountId);
   if (!token) {
     const unresolvedSuffix =
       unresolvedReasons.length > 0 ? ` unresolvedRefs=${unresolvedReasons.join(" | ")}` : "";
+    const diagnosticsSuffix =
+      diagnostics.length > 0 ? ` diagnostics=${diagnostics.join(" ; ")}` : "";
     api.logger.warn(
-      `slack-subagent-card: no Slack bot token found for accountId=${accountId ?? "default"}; skipping${unresolvedSuffix}`,
+      `slack-subagent-card: no Slack bot token found for accountId=${accountId ?? "default"}; skipping configSurface=${summarizeConfigSurface(api.config)} hasResolver=${Boolean(api.resolveConfiguredSecretInputWithFallback)} hasClientFactory=${Boolean(api.createSlackWebClient)}${unresolvedSuffix}${diagnosticsSuffix}`,
     );
     return undefined;
   }
   const cached = shared.webClients.get(token);
   if (cached) return cached;
-  const client = api.createSlackWebClient?.(token);
+  const client =
+    api.createSlackWebClient?.(token) ??
+    api.fallbackSlackWebClientFactory?.(token) ??
+    createNativeSlackWebClient(token, api.logger);
   if (!client) {
     api.logger.warn("slack-subagent-card: no Slack client factory available; skipping");
     return undefined;
@@ -1033,18 +1154,182 @@ function asNonEmptyIdString(value: unknown): string | undefined {
   return undefined;
 }
 
+function asDirectPlaintextSecret(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return /^\$\{.+\}$/.test(trimmed) ? undefined : trimmed;
+}
+
+function createNativeSlackWebClient(token: string, log: Logger): SlackWebClient | undefined {
+  try {
+    log.info("slack-subagent-card: using native Slack WebClient fallback");
+    return new WebClient(token) as unknown as SlackWebClient;
+  } catch (error) {
+    log.warn(`slack-subagent-card: failed to construct native Slack WebClient: ${stringifyError(error)}`);
+    return undefined;
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function resolveSlackBotTokenFromLocalConfig(
+  api: PluginApi,
+  accountId?: string,
+): Promise<SlackTokenResolution & { path?: string }> {
+  if (process.env.OPENCLAW_SLACK_SUBAGENT_CARD_DISABLE_LOCAL_CONFIG_FALLBACK === "1") {
+    return {
+      diagnostics: ["localConfig(status=disabled-by-env)"],
+      unresolvedReasons: [],
+    };
+  }
+  const configPath =
+    asNonEmptyString(process.env.OPENCLAW_SLACK_SUBAGENT_CARD_CONFIG_PATH) ??
+    path.join(os.homedir(), ".openclaw", "openclaw.json");
+  const diagnostics: string[] = [];
+  const unresolvedReasons: string[] = [];
+
+  let raw: string;
+  try {
+    raw = await fs.readFile(configPath, "utf8");
+  } catch (error) {
+    diagnostics.push(
+      `localConfig(path=${configPath} status=${isMissingFileError(error) ? "missing" : `read-error:${truncate(stringifyError(error), 160)}`})`,
+    );
+    return { diagnostics, unresolvedReasons };
+  }
+
+  let parsed: OpenClawConfig;
+  try {
+    parsed = JSON.parse(raw) as OpenClawConfig;
+  } catch (error) {
+    diagnostics.push(`localConfig(path=${configPath} status=parse-error:${truncate(stringifyError(error), 160)})`);
+    return { diagnostics, unresolvedReasons };
+  }
+
+  diagnostics.push(`localConfig(path=${configPath} status=loaded surface=${summarizeConfigSurface(parsed)})`);
+
+  for (const candidate of buildSlackBotTokenCandidates(parsed, accountId)) {
+    const resolved = await resolveSlackBotTokenCandidate(api, parsed, candidate.value, candidate.path);
+    diagnostics.push(`localConfig.${formatTokenCandidateDiagnostic(candidate, resolved)}`);
+    if (resolved.token) {
+      return {
+        token: resolved.token,
+        diagnostics,
+        unresolvedReasons,
+        path: `${configPath}:${candidate.path}`,
+      };
+    }
+    if (resolved.unresolvedReason) {
+      unresolvedReasons.push(resolved.unresolvedReason);
+    }
+  }
+
+  return { diagnostics, unresolvedReasons, path: configPath };
+}
+
+function formatTokenCandidateDiagnostic(
+  candidate: SlackBotTokenCandidate,
+  resolved: SlackBotTokenCandidateResolution,
+): string {
+  const segments = [`${candidate.path}(input=${describeSecretInput(candidate.value)}`];
+  if (resolved.source) segments.push(`source=${resolved.source}`);
+  if (resolved.unresolvedReason) segments.push(`unresolved=${truncate(resolved.unresolvedReason, 120)}`);
+  segments.push(`resolved=${resolved.token ? summarizeResolvedToken(resolved.token) : "missing"})`);
+  return segments.join(" ");
+}
+
+function summarizeResolvedToken(token: string): string {
+  return `${describeTokenFlavor(token)} len=${token.length}`;
+}
+
+function describeSecretInput(value: unknown): string {
+  if (value === undefined || value === null) return "missing";
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return "empty-string";
+    if (/^\$\{.+\}$/.test(trimmed)) return "secret-ref";
+    return `string(${summarizeResolvedToken(trimmed)})`;
+  }
+  if (Array.isArray(value)) return `array(len=${value.length})`;
+  if (typeof value === "object") {
+    const keys = Object.keys(value as Record<string, unknown>);
+    return `object(keys=${truncate(keys.join(","), 80) || "none"})`;
+  }
+  return typeof value;
+}
+
+function describeTokenFlavor(token: string): string {
+  if (/^xoxb-/i.test(token)) return "xoxb";
+  if (/^xapp-/i.test(token)) return "xapp";
+  if (/^xoxp-/i.test(token)) return "xoxp";
+  return "opaque-token";
+}
+
+function summarizeConfigSurface(config: OpenClawConfig | undefined): string {
+  if (!config) return "none";
+  const topLevelKeys = Object.keys(config).sort();
+  const directAccountKeys = Object.keys(config.accounts ?? {}).sort();
+  const rootSlack = config.channels?.slack;
+  const rootAccountKeys = Object.keys(rootSlack?.accounts ?? {}).sort();
+  return [
+    `topLevelKeys=${topLevelKeys.length > 0 ? topLevelKeys.join(",") : "none"}`,
+    `directBotToken=${describeSecretInput(config.botToken)}`,
+    `directAccounts=${directAccountKeys.length > 0 ? directAccountKeys.join(",") : "none"}`,
+    `rootSlack=${rootSlack ? "present" : "missing"}`,
+    `rootBotToken=${describeSecretInput(rootSlack?.botToken)}`,
+    `rootAccounts=${rootAccountKeys.length > 0 ? rootAccountKeys.join(",") : "none"}`,
+  ].join(" ");
+}
+
+function summarizeRequester(requester: SlackRequester | undefined): string {
+  if (!requester) return "none";
+  return [
+    `channel=${asNonEmptyString(requester.channel) ?? "unknown"}`,
+    `accountId=${asNonEmptyString(requester.accountId) ?? "default"}`,
+    `to=${asNonEmptyString(requester.to) ?? "none"}`,
+    `threadId=${asNonEmptyIdString(requester.threadId) ?? "none"}`,
+  ].join(",");
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return asNonEmptyString(asRecord(error)?.code) === "ENOENT";
+}
+
 function stringifyError(error: unknown): string {
-  if (error instanceof Error) return error.stack || error.message;
+  const slackDetails = summarizeSlackError(error);
+  if (error instanceof Error) {
+    const base = error.stack || error.message;
+    return slackDetails ? `${base} (${slackDetails})` : base;
+  }
   if (typeof error === "string") return error;
   try {
-    return JSON.stringify(error);
+    const serialized = JSON.stringify(error);
+    return slackDetails ? `${serialized} (${slackDetails})` : serialized;
   } catch {
-    return String(error);
+    const fallback = String(error);
+    return slackDetails ? `${fallback} (${slackDetails})` : fallback;
   }
+}
+
+function summarizeSlackError(error: unknown): string | undefined {
+  const record = asRecord(error);
+  const data = asRecord(record?.data);
+  const responseMetadata = asRecord(data?.response_metadata);
+  const metadataMessages = Array.isArray(responseMetadata?.messages)
+    ? responseMetadata.messages.filter(
+        (value): value is string => typeof value === "string" && value.trim().length > 0,
+      )
+    : [];
+  const parts = [
+    asNonEmptyString(record?.code) ? `code=${asNonEmptyString(record?.code)}` : undefined,
+    asNonEmptyString(data?.error) ? `slack_error=${asNonEmptyString(data?.error)}` : undefined,
+    asFiniteNumber(data?.statusCode) ? `status=${asFiniteNumber(data?.statusCode)}` : undefined,
+    metadataMessages.length > 0 ? `messages=${truncate(metadataMessages.join(" | "), 160)}` : undefined,
+  ].filter((value): value is string => Boolean(value));
+  return parts.length > 0 ? parts.join(" ") : undefined;
 }
 
 export { buildFallbackText };

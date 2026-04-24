@@ -354,6 +354,54 @@ describe("slack subagent card handlers", () => {
     assert.equal(harness.web.posts.length, 0);
   });
 
+  it("uses a plaintext configured Slack bot token even if the resolver returns empty", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Configured token",
+        status: "running",
+      },
+    });
+    harness.api.config = { channels: { slack: { botToken: TOKEN } } };
+    harness.api.resolveConfiguredSecretInputWithFallback = async () => ({ secretRefConfigured: false });
+    delete process.env.SLACK_BOT_TOKEN;
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.posts.length, 1);
+  });
+
+  it("uses the fallback Slack client factory when the host client factory is missing", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Fallback client",
+        status: "running",
+      },
+    });
+    harness.shared.webClients.clear();
+    harness.api.createSlackWebClient = undefined;
+    harness.api.fallbackSlackWebClientFactory = () => harness.web;
+    harness.api.config = { channels: { slack: { botToken: TOKEN } } };
+    delete process.env.SLACK_BOT_TOKEN;
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.posts.length, 1);
+  });
+
   it("serializes delivery and terminal updates so terminal outcome wins", async () => {
     const harness = makeHarness({
       task: {
@@ -428,6 +476,9 @@ function makeHarness({ task }) {
       warn() {},
       debug() {},
     },
+    fallbackSlackWebClientFactory() {
+      return web;
+    },
     runtime: {
       tasks: {
         runs: {
@@ -446,6 +497,7 @@ function makeHarness({ task }) {
   };
 
   process.env.SLACK_BOT_TOKEN = TOKEN;
+  process.env.OPENCLAW_SLACK_SUBAGENT_CARD_DISABLE_LOCAL_CONFIG_FALLBACK = "1";
   return harness;
 }
 
