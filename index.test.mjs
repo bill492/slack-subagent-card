@@ -6,6 +6,7 @@ import {
   handleDeliveryTarget,
   handleEnded,
   handleSpawned,
+  registerSlackSubagentCardHandlers,
 } from "./dist/plugin-handlers.js";
 
 const THREAD_SESSION_KEY = "agent:test:slack:channel:C123:thread:1700000000.000100";
@@ -94,6 +95,240 @@ describe("slack subagent card handlers", () => {
     assert.equal(getTask(harness.web.updates[0]).details.elements[0].elements[0].text, "Still gathering");
     assert.equal(getTask(harness.web.updates[1]).status, "complete");
     assert.equal(getTask(harness.web.updates[1]).details.elements[0].elements[0].text, "Final answer is ready");
+  });
+
+  it("backfills a completed card when delivery target arrives without spawned tracking", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Investigate delivery",
+        status: "succeeded",
+        publicTerminalSummary: "Delivered through announce",
+      },
+    });
+
+    await handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      {
+        childRunId: "run-1234567890",
+        childSessionKey: "agent:test:acp:child",
+        expectsCompletionMessage: true,
+        requesterSessionKey: "agent:test:main",
+        requesterOrigin: {
+          channel: "slack",
+          to: "channel:C123",
+          threadId: "1700000000.000100",
+        },
+        spawnMode: "run",
+      },
+      { requesterSessionKey: "agent:test:main" },
+    );
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(harness.web.posts[0].channel, "C123");
+    assert.equal(harness.web.posts[0].thread_ts, "1700000000.000100");
+    assert.equal(harness.web.posts[0].text, "Sub-agent Investigate delivery: ✅ Completed");
+    assert.equal(getTask(harness.web.posts[0]).status, "complete");
+    assert.equal(
+      getTask(harness.web.posts[0]).details.elements[0].elements[0].text,
+      "Delivered through announce",
+    );
+  });
+
+  it("cleans up an untracked delivery reservation when backfill posting fails", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Post failure",
+        status: "succeeded",
+        publicTerminalSummary: "Delivered through announce",
+      },
+    });
+    harness.web.onPost = async () => {
+      throw new Error("slack unavailable");
+    };
+
+    await assert.rejects(
+      () =>
+        handleDeliveryTarget(
+          harness.api,
+          harness.shared,
+          {
+            childRunId: "run-1234567890",
+            expectsCompletionMessage: true,
+            requesterSessionKey: "agent:test:main",
+            requesterOrigin: {
+              channel: "slack",
+              to: "channel:C123",
+              threadId: "1700000000.000100",
+            },
+          },
+          { requesterSessionKey: "agent:test:main" },
+        ),
+      /slack unavailable/,
+    );
+
+    assert.equal(harness.shared.runs.has("run-1234567890"), false);
+  });
+
+  it("allows delivery update queued before terminal ok to complete", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Race",
+        status: "running",
+        publicProgressSummary: "Queued delivery",
+      },
+    });
+    const deliveryUpdate = deferred();
+    harness.web.onUpdate = (payload) => {
+      if (harness.web.updates.length === 1) return deliveryUpdate.promise;
+      return Promise.resolve({ ok: true, payload });
+    };
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    const delivery = handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      { childRunId: "run-1234567890", expectsCompletionMessage: true },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await waitFor(() => harness.web.updates.length === 1);
+
+    harness.currentTask = {
+      id: "task-1234567890",
+      runId: "run-1234567890",
+      title: "Race",
+      status: "succeeded",
+      publicTerminalSummary: "Final ok",
+    };
+    const ended = handleEnded(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", outcome: "ok" },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    deliveryUpdate.resolve({ ok: true });
+    await Promise.all([delivery, ended]);
+
+    assert.equal(harness.web.updates.length, 2);
+    assert.equal(getTask(harness.web.updates[0]).details.elements[0].elements[0].text, "Queued delivery");
+    assert.equal(getTask(harness.web.updates[1]).details.elements[0].elements[0].text, "Final ok");
+  });
+
+  it("normalizes legacy shared state left by older plugin versions", async () => {
+    try {
+      const harness = makeHarness({
+        task: {
+          id: "task-1234567890",
+          runId: "run-1234567890",
+          title: "Legacy state",
+          status: "running",
+        },
+      });
+      const legacyRegisteredApis = new WeakSet();
+      legacyRegisteredApis.add(harness.api);
+      globalThis.__slackSubagentCardSharedState = {
+        runs: new Map(),
+        registeredApis: legacyRegisteredApis,
+        pluginBotId: "B123",
+      };
+      harness.api.registrationMode = "full";
+      harness.api.createSlackWebClient = () => harness.web;
+      const handlers = new Map();
+      harness.api.on = (hookName, handler) => {
+        handlers.set(hookName, handler);
+      };
+
+      registerSlackSubagentCardHandlers(harness.api);
+      await handlers.get("subagent_spawned")(
+        { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+        { requesterSessionKey: THREAD_SESSION_KEY },
+      );
+
+      assert.ok(globalThis.__slackSubagentCardSharedState.webClients instanceof Map);
+      assert.equal(harness.web.posts.length, 1);
+    } finally {
+      delete globalThis.__slackSubagentCardSharedState;
+    }
+  });
+
+  it("posts when Slack thread id is numeric", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Numeric thread",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: 1700000000.0001 } },
+      { requesterSessionKey: "agent:test:main" },
+    );
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(harness.web.posts[0].thread_ts, "1700000000.0001");
+  });
+
+  it("does not backfill a duplicate card while spawn posting is in flight", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Race",
+        status: "succeeded",
+        publicTerminalSummary: "Done",
+      },
+    });
+    const spawnPost = deferred();
+    harness.web.onPost = (payload) => {
+      if (harness.web.posts.length === 1) return spawnPost.promise;
+      return Promise.resolve({ ts: "1700000000.000300", payload });
+    };
+
+    const spawned = handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await waitFor(() => harness.web.posts.length === 1);
+
+    const delivery = handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      {
+        childRunId: "run-1234567890",
+        expectsCompletionMessage: true,
+        requesterSessionKey: THREAD_SESSION_KEY,
+        requesterOrigin: { channel: "slack", to: "channel:C123", threadId: "1700000000.000100" },
+      },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    await assertRemainsPending(delivery);
+    assert.equal(harness.web.posts.length, 1);
+    spawnPost.resolve({ ts: "1700000000.000200" });
+    await Promise.all([spawned, delivery]);
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(harness.web.updates.length, 1);
+    assert.equal(getTask(harness.web.updates[0]).status, "complete");
   });
 
   it("treats an empty secret resolver result as unresolved instead of throwing", async () => {
@@ -218,10 +453,12 @@ function makeFakeWeb() {
   const web = {
     posts: [],
     updates: [],
+    onPost: undefined,
     onUpdate: undefined,
     chat: {
       async postMessage(payload) {
         web.posts.push(payload);
+        if (web.onPost) return web.onPost(payload);
         return { ts: "1700000000.000200" };
       },
       async update(payload) {
@@ -255,4 +492,16 @@ async function waitFor(predicate) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.fail("condition was not met before timeout");
+}
+
+async function assertRemainsPending(promise) {
+  const marker = Symbol("pending");
+  const result = await Promise.race([
+    promise.then(
+      () => "resolved",
+      () => "rejected",
+    ),
+    Promise.resolve(marker),
+  ]);
+  assert.equal(result, marker);
 }

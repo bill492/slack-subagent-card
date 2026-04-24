@@ -46,7 +46,7 @@ type SlackRequester = {
   channel?: string;
   accountId?: string;
   to?: string;
-  threadId?: string;
+  threadId?: string | number;
 };
 
 export type HookContext = {
@@ -111,9 +111,9 @@ export type PluginApi = {
 };
 
 type TrackedRun = {
-  messageTs: string;
-  channelId: string;
-  threadTs: string;
+  messageTs?: string;
+  channelId?: string;
+  threadTs?: string;
   accountId?: string;
   startedAt: number;
   endedAt?: number;
@@ -122,14 +122,16 @@ type TrackedRun = {
   requesterSessionKey?: string;
   deliveryRenderedTerminalTaskSignal?: boolean;
   deliveryUpdateSucceeded?: boolean;
-  terminalUpdateStarted?: boolean;
+  terminalUpdateQueued?: boolean;
   updateChain?: Promise<void>;
+  initializing?: Promise<void>;
 };
 
 export type SharedState = {
   runs: Map<string, TrackedRun>;
   registeredApis: WeakSet<object>;
   webClients: Map<string, SlackWebClient>;
+  stateVersion: number;
 };
 
 type SlackThreadTarget = {
@@ -141,6 +143,7 @@ const SHARED_STATE_KEY = "__slackSubagentCardSharedState";
 const STALE_RUN_TTL_MS = 60 * 60 * 1000;
 const TASK_LOOKUP_RETRY_MS = 250;
 const CARD_TEXT_PREFIX = "Sub-agent ";
+const SHARED_STATE_VERSION = 2;
 const SLACK_THREAD_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^:]+):thread:(.+)$/;
 const SLACK_TOPIC_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^-]+)-topic-(.+)$/;
 
@@ -218,41 +221,42 @@ export async function handleSpawned(
     mode: event.mode,
   });
 
-  const sent = await withSlackRetry(
-    () =>
-      web.chat.postMessage({
-        channel: target.channelId,
-        thread_ts: target.threadTs,
-        text: buildFallbackText(cardTitle, "SubAgent Running"),
-        parse: "none",
-        blocks: buildBlocks({
-          label: cardTitle,
-          statusText: runningContent.statusText,
-          detail: runningContent.detail,
-          outputText: runningContent.outputText,
-          taskId: runningContent.taskId,
-          slackTaskStatus: runningContent.slackTaskStatus,
-        }) as any,
-      }),
-    api.logger,
-  );
-
-  const messageTs = asNonEmptyString((sent as any)?.ts) ?? asNonEmptyString((sent as any)?.message?.ts);
-  if (!messageTs) {
-    api.logger.warn(`slack-subagent-card: postMessage returned no ts for runId=${runId}; skipping tracking`);
-    return;
-  }
-
-  shared.runs.set(runId, {
-    messageTs,
-    channelId: target.channelId,
-    threadTs: target.threadTs,
+  const tracked = createTrackedRun({
     accountId: asNonEmptyString(event.requester?.accountId),
-    startedAt: Date.now(),
     label: cardTitle,
     mode: event.mode,
     requesterSessionKey,
   });
+  const existing = shared.runs.get(runId);
+  if (existing?.initializing) await existing.initializing.catch(() => undefined);
+  if (!reserveTrackedRun(shared, runId, tracked)) return;
+  tracked.initializing = postSlackTaskCard({
+    web,
+    logger: api.logger,
+    target,
+    label: cardTitle,
+    statusText: runningContent.statusText,
+    fallbackStatusText: "SubAgent Running",
+    content: runningContent,
+  })
+    .then((messageTs) => {
+      if (!messageTs) {
+        api.logger.warn(`slack-subagent-card: postMessage returned no ts for runId=${runId}; skipping tracking`);
+        cleanupTrackedRun(shared, runId, tracked);
+        return;
+      }
+      tracked.messageTs = messageTs;
+      tracked.channelId = target.channelId;
+      tracked.threadTs = target.threadTs;
+    })
+    .catch((error) => {
+      cleanupTrackedRun(shared, runId, tracked);
+      throw error;
+    })
+    .finally(() => {
+      delete tracked.initializing;
+    });
+  await tracked.initializing;
 
   api.logger.debug?.(
     `slack-subagent-card: posted card for runId=${runId} channel=${target.channelId} thread=${target.threadTs}`,
@@ -271,7 +275,12 @@ export async function handleDeliveryTarget(
   if (!runId) return;
 
   const tracked = shared.runs.get(runId);
-  if (!tracked) return;
+  if (!tracked) {
+    await postBackfilledDeliveryCard(api, shared, event, ctx, runId);
+    return;
+  }
+  await tracked.initializing?.catch(() => undefined);
+  if (!isPostedTrackedRun(tracked)) return;
 
   const web = await resolveSlackWebClient(
     api,
@@ -316,6 +325,88 @@ export async function handleDeliveryTarget(
   }
 }
 
+async function postBackfilledDeliveryCard(
+  api: PluginApi,
+  shared: SharedState,
+  event: SubagentDeliveryTargetEvent,
+  ctx: HookContext,
+  runId: string,
+): Promise<void> {
+  const requesterSessionKey =
+    asNonEmptyString(event.requesterSessionKey) ?? asNonEmptyString(ctx.requesterSessionKey);
+  if (!requesterSessionKey) return;
+
+  if (!hasSlackThreadTargetHint(requesterSessionKey, event.requesterOrigin)) {
+    api.logger.debug?.(`slack-subagent-card: delivery target has no Slack thread for untracked runId=${runId}`);
+    return;
+  }
+
+  const web = await resolveSlackWebClient(api, shared, event.requesterOrigin?.accountId);
+  if (!web) return;
+
+  const target = await resolveSlackThreadTarget(requesterSessionKey, event.requesterOrigin, web, api.logger);
+  if (!target) {
+    api.logger.debug?.(
+      `slack-subagent-card: no Slack delivery target for untracked runId=${runId} requesterSessionKey=${requesterSessionKey}`,
+    );
+    return;
+  }
+
+  const task = await resolveTaskRunWithRetry(api, requesterSessionKey, runId);
+  const label =
+    asNonEmptyString(task?.label) ??
+    asNonEmptyString(task?.title) ??
+    asNonEmptyString(event.childSessionKey) ??
+    runId;
+  const cardTitle = truncate(label, 80);
+  const completionContent = buildTerminalContent({
+    task,
+    runId,
+    outcome: "ok",
+    elapsedText: formatElapsed(0),
+    mode: event.spawnMode,
+  });
+
+  const tracked = createTrackedRun({
+    accountId: asNonEmptyString(event.requesterOrigin?.accountId),
+    endedAt: Date.now(),
+    label: cardTitle,
+    mode: event.spawnMode,
+    requesterSessionKey,
+    deliveryUpdateSucceeded: true,
+    deliveryRenderedTerminalTaskSignal: completionContent.usedTerminalTaskSignal,
+  });
+  if (!reserveTrackedRun(shared, runId, tracked)) return;
+
+  let messageTs: string | undefined;
+  try {
+    messageTs = await postSlackTaskCard({
+      web,
+      logger: api.logger,
+      target,
+      label: cardTitle,
+      statusText: completionContent.statusText,
+      content: completionContent,
+    });
+  } catch (error) {
+    cleanupTrackedRun(shared, runId, tracked);
+    throw error;
+  }
+  if (!messageTs) {
+    api.logger.warn(`slack-subagent-card: backfilled postMessage returned no ts for runId=${runId}`);
+    cleanupTrackedRun(shared, runId, tracked);
+    return;
+  }
+
+  tracked.messageTs = messageTs;
+  tracked.channelId = target.channelId;
+  tracked.threadTs = target.threadTs;
+
+  api.logger.debug?.(
+    `slack-subagent-card: backfilled delivery card for runId=${runId} channel=${target.channelId} thread=${target.threadTs}`,
+  );
+}
+
 export async function handleEnded(
   api: PluginApi,
   shared: SharedState,
@@ -331,7 +422,11 @@ export async function handleEnded(
     return;
   }
 
-  tracked.terminalUpdateStarted = true;
+  await tracked.initializing?.catch(() => undefined);
+  if (!isPostedTrackedRun(tracked)) {
+    cleanupTrackedRun(shared, runId, tracked);
+    return;
+  }
 
   const web = await resolveSlackWebClient(
     api,
@@ -344,6 +439,7 @@ export async function handleEnded(
   }
 
   const outcome = normalizeOutcome(event.outcome);
+  tracked.terminalUpdateQueued = true;
   if (canSkipTerminalUpdateAfterDelivery(tracked, outcome)) {
     cleanupTrackedRun(shared, runId);
     return;
@@ -426,10 +522,46 @@ function buildBlocks(params: {
   ];
 }
 
+async function postSlackTaskCard(params: {
+  web: SlackWebClient;
+  logger: Logger;
+  target: SlackThreadTarget;
+  label: string;
+  statusText: string;
+  fallbackStatusText?: string;
+  content: {
+    detail: string;
+    outputText?: string;
+    taskId: string;
+    slackTaskStatus: SlackTaskStatus;
+  };
+}): Promise<string | undefined> {
+  const sent = await withSlackRetry(
+    () =>
+      params.web.chat.postMessage({
+        channel: params.target.channelId,
+        thread_ts: params.target.threadTs,
+        text: buildFallbackText(params.label, params.fallbackStatusText ?? params.statusText),
+        parse: "none",
+        blocks: buildBlocks({
+          label: params.label,
+          statusText: params.statusText,
+          detail: params.content.detail,
+          outputText: params.content.outputText,
+          taskId: params.content.taskId,
+          slackTaskStatus: params.content.slackTaskStatus,
+        }) as any,
+      }),
+    params.logger,
+  );
+
+  return asNonEmptyString((sent as any)?.ts) ?? asNonEmptyString((sent as any)?.message?.ts);
+}
+
 async function updateSlackTaskCard(params: {
   web: SlackWebClient;
   logger: Logger;
-  tracked: TrackedRun;
+  tracked: TrackedRun & { messageTs: string; channelId: string };
   content: {
     statusText: string;
     detail: string;
@@ -458,6 +590,39 @@ async function updateSlackTaskCard(params: {
       }),
     params.logger,
   );
+}
+
+function createTrackedRun(params: {
+  accountId?: string;
+  endedAt?: number;
+  label: string;
+  mode?: Mode;
+  requesterSessionKey: string;
+  deliveryRenderedTerminalTaskSignal?: boolean;
+  deliveryUpdateSucceeded?: boolean;
+}): TrackedRun {
+  return {
+    accountId: params.accountId,
+    startedAt: Date.now(),
+    endedAt: params.endedAt,
+    label: params.label,
+    mode: params.mode,
+    requesterSessionKey: params.requesterSessionKey,
+    deliveryRenderedTerminalTaskSignal: params.deliveryRenderedTerminalTaskSignal,
+    deliveryUpdateSucceeded: params.deliveryUpdateSucceeded,
+  };
+}
+
+function isPostedTrackedRun(
+  tracked: TrackedRun,
+): tracked is TrackedRun & { messageTs: string; channelId: string; threadTs: string } {
+  return Boolean(tracked.messageTs && tracked.channelId && tracked.threadTs);
+}
+
+function reserveTrackedRun(shared: SharedState, runId: string, tracked: TrackedRun): boolean {
+  if (shared.runs.has(runId)) return false;
+  shared.runs.set(runId, tracked);
+  return true;
 }
 
 function resolveTaskRun(api: PluginApi, requesterSessionKey: string | undefined, runId: string): TaskRunDetail | undefined {
@@ -502,7 +667,7 @@ function validateTrackedRequesterSessionKey(
 }
 
 function canApplyDeliveryUpdate(current: TrackedRun | undefined, tracked: TrackedRun): boolean {
-  return current === tracked && !tracked.terminalUpdateStarted;
+  return current === tracked && !tracked.terminalUpdateQueued;
 }
 
 function canSkipTerminalUpdateAfterDelivery(tracked: TrackedRun, outcome: string | undefined): boolean {
@@ -569,7 +734,7 @@ async function resolveSlackThreadTarget(
   }
 
   const rawTarget = asNonEmptyString(requester?.to);
-  const threadTs = asNonEmptyString(requester?.threadId);
+  const threadTs = asNonEmptyIdString(requester?.threadId);
   if (!rawTarget || !threadTs) return null;
 
   let channelId = normalizeSlackChannelId(stripSlackTargetPrefix(rawTarget));
@@ -611,7 +776,9 @@ function hasSlackThreadTargetHint(
   requester: SlackRequester | undefined,
 ): boolean {
   if (parseSlackThreadSessionKey(requesterSessionKey)) return true;
-  return Boolean(asNonEmptyString(requester?.to) && asNonEmptyString(requester?.threadId));
+  const requesterChannel = asNonEmptyString(requester?.channel)?.toLowerCase();
+  if (requesterChannel && requesterChannel !== "slack") return false;
+  return Boolean(asNonEmptyString(requester?.to) && asNonEmptyIdString(requester?.threadId));
 }
 
 type SlackTokenResolution = {
@@ -804,8 +971,10 @@ function cleanupStaleRuns(shared: SharedState, log: Logger): void {
   }
 }
 
-function cleanupTrackedRun(shared: SharedState, runId: string): void {
-  shared.runs.delete(runId);
+function cleanupTrackedRun(shared: SharedState, runId: string, tracked?: TrackedRun): void {
+  if (!tracked || shared.runs.get(runId) === tracked) {
+    shared.runs.delete(runId);
+  }
 }
 
 export function createSharedState(): SharedState {
@@ -813,6 +982,7 @@ export function createSharedState(): SharedState {
     runs: new Map(),
     registeredApis: new WeakSet(),
     webClients: new Map(),
+    stateVersion: SHARED_STATE_VERSION,
   };
 }
 
@@ -825,7 +995,17 @@ function getSharedState(): SharedState {
     scope[SHARED_STATE_KEY] = createSharedState();
   }
 
+  normalizeSharedState(scope[SHARED_STATE_KEY]!);
   return scope[SHARED_STATE_KEY]!;
+}
+
+function normalizeSharedState(shared: Partial<SharedState>): asserts shared is SharedState {
+  if (!(shared.runs instanceof Map)) shared.runs = new Map();
+  if (shared.stateVersion !== SHARED_STATE_VERSION || !(shared.registeredApis instanceof WeakSet)) {
+    shared.registeredApis = new WeakSet();
+  }
+  if (!(shared.webClients instanceof Map)) shared.webClients = new Map();
+  shared.stateVersion = SHARED_STATE_VERSION;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -845,6 +1025,12 @@ function asFiniteNumber(value: unknown): number | undefined {
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function asNonEmptyIdString(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() ? value : undefined;
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : undefined;
+  return undefined;
 }
 
 function sleep(ms: number): Promise<void> {
