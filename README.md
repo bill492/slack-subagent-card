@@ -4,6 +4,12 @@ Slack status cards for OpenClaw sub-agent work.
 
 This plugin posts a Block Kit `plan` card into the originating Slack thread when a sub-agent is spawned, then updates that card as the work completes or fails.
 
+## Version
+
+Current release candidate: **1.2.0**.
+
+Version `1.2.0` adds safer task-summary rendering, stronger lifecycle ordering, handler-level regression tests, and cleaner packaging for OpenClaw plugin distribution.
+
 ## Current Phase
 
 This repo is currently at **Phase 1: richer sub-agent lifecycle cards**.
@@ -15,6 +21,9 @@ What Phase 1 includes:
 - Updates to a completed state when a completion delivery target is reached.
 - Updates to terminal states for `error`, `timeout`, `killed`, `reset`, and `deleted`.
 - Preserves per-account Slack client selection for multi-account setups.
+- Uses the original requester session for task-detail lookup after spawn.
+- Serializes Slack card updates so terminal outcomes win over in-flight delivery updates.
+- Renders task summaries only from explicit public/redacted task fields.
 - Stays presentation-only: it does **not** wake parent sessions, enqueue system events, or perform orchestration logic.
 
 ## Hook Surface
@@ -30,6 +39,21 @@ The intended behavior is:
 - `subagent_spawned` posts the initial card.
 - `subagent_delivery_target` marks completion early only for runs with `expectsCompletionMessage=true`.
 - `subagent_ended` finalizes the card for terminal outcomes and cleans up tracked state.
+
+## Task Summary Safety
+
+Slack cards can include task progress and terminal summaries when OpenClaw provides explicit public or redacted fields:
+
+- `publicProgressSummary`
+- `publicTerminalSummary`
+- `publicError`
+- `redactedProgressSummary`
+- `redactedTerminalSummary`
+- `redactedError`
+
+Raw runtime fields such as `progressSummary`, `terminalSummary`, and `error` are not rendered directly into Slack cards. This keeps tool output, stack traces, prompts, and secrets out of Slack unless OpenClaw has explicitly prepared a public/redacted value.
+
+The plugin still applies local redaction and internal-context stripping as a defense-in-depth step before placing text into Slack blocks.
 
 ## Why This Stays A Plugin
 
@@ -93,17 +117,33 @@ Potential direction:
 - This plugin does not yet stream intermediate sub-agent progress.
 - It does not currently attach Slack `sources` links to cards.
 - It does not yet provide a config flag to expand beyond sub-agent usage.
-- Full compile/build validation requires the plugin dependencies to be installed locally.
+- Full compile/build validation requires OpenClaw plugin SDK dependencies to be installed locally.
+- npm publication may require an npm OTP when the publishing account has two-factor authentication enabled for writes.
 
 ## Package Notes
 
 - Manifest: `openclaw.plugin.json`
 - Entrypoint: `index.ts`
+- Handler module: `plugin-handlers.ts`
+- Card content module: `task-card.ts`
+- Text sanitization module: `task-text-sanitizer.ts`
 - Package metadata includes `openclaw.extensions`, `openclaw.compat`, and `openclaw.build`.
+- `package.json` and `openclaw.plugin.json` should use the same release version.
+
+## Validation
+
+Local validation:
+
+```sh
+npm test
+```
+
+When the published `openclaw` package lags the required plugin SDK version, this repo can be tested against a local OpenClaw checkout by installing that checkout as the `openclaw` dependency.
 
 ## Suggested Next Step
 
 If continuing the roadmap, the next high-value improvement is:
 
-1. add optional richer completion/output text for sub-agents
-2. then add a config flag for broader activity-card usage
+1. add `sources` support for public task outputs
+2. add optional richer completion/output text for sub-agents
+3. then add a config flag for broader activity-card usage
