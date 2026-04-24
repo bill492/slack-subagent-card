@@ -15,7 +15,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "openclaw": ">=2026.4.24",
+    "openclaw": ">=2026.4.22",
     "typescript": "^5.9.0"
   },
   "openclaw": {
@@ -26,15 +26,15 @@
       "./dist/index.js"
     ],
     "install": {
-      "minHostVersion": ">=2026.4.24"
+      "minHostVersion": ">=2026.4.22"
     },
     "compat": {
-      "pluginApi": ">=2026.4.24",
-      "minGatewayVersion": ">=2026.4.24"
+      "pluginApi": ">=2026.4.22",
+      "minGatewayVersion": ">=2026.4.22"
     },
     "build": {
-      "openclawVersion": "2026.4.24",
-      "pluginSdkVersion": "2026.4.24"
+      "openclawVersion": "2026.4.22",
+      "pluginSdkVersion": "2026.4.22"
     }
   },
   "keywords": [
@@ -55,7 +55,7 @@
     "node": ">=22"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.4.24"
+    "openclaw": ">=2026.4.22"
   },
   "peerDependenciesMeta": {
     "openclaw": {
