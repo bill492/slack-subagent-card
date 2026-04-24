@@ -685,8 +685,8 @@ async function resolveSlackBotTokenCandidate(
   });
 
   return {
-    token: resolved.value,
-    unresolvedReason: resolved.unresolvedRefReason,
+    token: asNonEmptyString(resolved?.value),
+    unresolvedReason: asNonEmptyString(resolved?.unresolvedRefReason),
   };
 }
 

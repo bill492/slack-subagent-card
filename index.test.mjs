@@ -96,6 +96,29 @@ describe("slack subagent card handlers", () => {
     assert.equal(getTask(harness.web.updates[1]).details.elements[0].elements[0].text, "Final answer is ready");
   });
 
+  it("treats an empty secret resolver result as unresolved instead of throwing", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Investigate",
+        status: "running",
+      },
+    });
+    harness.api.config = { channels: { slack: { botToken: undefined } } };
+    harness.api.resolveConfiguredSecretInputWithFallback = async () => ({ secretRefConfigured: false });
+    delete process.env.SLACK_BOT_TOKEN;
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.posts.length, 0);
+  });
+
   it("serializes delivery and terminal updates so terminal outcome wins", async () => {
     const harness = makeHarness({
       task: {
