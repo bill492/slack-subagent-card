@@ -117,7 +117,7 @@ export type PluginApi = {
     tasks?: PluginRuntimeTasks;
   };
   registrationMode?: string;
-  on: (
+  on?: (
     hookName: string,
     handler: (event: unknown, ctx: HookContext) => void | Promise<void>,
   ) => unknown;
@@ -163,7 +163,7 @@ const SLACK_TOPIC_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^-]+)-topic
 export function registerSlackSubagentCardHandlers(api: PluginApi, shared: SharedState = getSharedState()): void {
   const log = api.logger;
 
-  if (api.registrationMode !== "full") return;
+  if (typeof api.on !== "function") return;
   if (shared.registeredApis.has(api)) return;
   shared.registeredApis.add(api);
 

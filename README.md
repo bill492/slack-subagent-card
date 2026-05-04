@@ -6,9 +6,15 @@ This plugin posts a Slack Block Kit `plan` card in the originating Slack thread 
 
 ## Version
 
-Current package version: **1.2.3**.
+Current package version: **1.2.5**.
 
-Version `1.2.3` hardens card lifecycle handling for OpenClaw plugin SDK hosts:
+Version `1.2.5` fixes typed hook registration with OpenClaw 2026.5.x plugin hosts:
+
+- registers sub-agent hooks whenever the host exposes the typed `api.on` hook surface
+- restores `hookCount` reporting for `subagent_spawned`, `subagent_delivery_target`, and `subagent_ended`
+- keeps setup-only/plugin API loads safe by no-oping when typed hooks are unavailable
+
+Version `1.2.3` hardened card lifecycle handling for OpenClaw plugin SDK hosts:
 
 - backfills a completed Slack card when completion delivery has a valid Slack thread but spawn-time card tracking was missed
 - avoids duplicate cards when delivery arrives while the initial card post is still in flight

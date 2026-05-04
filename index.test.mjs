@@ -264,6 +264,45 @@ describe("slack subagent card handlers", () => {
     }
   });
 
+  it("registers typed hooks whenever the host exposes api.on", () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Discovery registration",
+        status: "running",
+      },
+    });
+    const handlers = new Map();
+    harness.api.registrationMode = "discovery";
+    harness.api.on = (hookName, handler) => {
+      handlers.set(hookName, handler);
+    };
+
+    registerSlackSubagentCardHandlers(harness.api);
+
+    assert.deepEqual([...handlers.keys()], [
+      "subagent_spawned",
+      "subagent_ended",
+      "subagent_delivery_target",
+    ]);
+  });
+
+  it("skips registration when the host does not expose typed hooks", () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Setup only",
+        status: "running",
+      },
+    });
+    delete harness.api.on;
+    harness.api.registrationMode = "setup-only";
+
+    assert.doesNotThrow(() => registerSlackSubagentCardHandlers(harness.api));
+  });
+
   it("posts when Slack thread id is numeric", async () => {
     const harness = makeHarness({
       task: {
