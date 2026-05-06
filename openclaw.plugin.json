@@ -3,6 +3,15 @@
   "name": "Slack Subagent Card",
   "version": "1.2.5",
   "description": "Posts and updates a Slack Block Kit status card for sub-agent work in Slack threads.",
+  "activation": {
+    "onStartup": true,
+    "onChannels": [
+      "slack"
+    ],
+    "onCapabilities": [
+      "hook"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false

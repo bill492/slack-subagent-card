@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
@@ -11,6 +12,20 @@ import {
 
 const THREAD_SESSION_KEY = "agent:test:slack:channel:C123:thread:1700000000.000100";
 const TOKEN = "xoxb-test-token";
+
+describe("plugin manifest", () => {
+  it("declares startup activation for Slack hook registration", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
+    );
+
+    assert.deepEqual(manifest.activation, {
+      onStartup: true,
+      onChannels: ["slack"],
+      onCapabilities: ["hook"],
+    });
+  });
+});
 
 describe("slack subagent card handlers", () => {
   it("uses the tracked requester session key and escapes Slack fallback text", async () => {
