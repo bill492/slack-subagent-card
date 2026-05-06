@@ -34,6 +34,11 @@ The release script refuses to continue unless all of these are true:
 - `gh` authentication works
 - `npm whoami` works
 - the target version is new
+- package OpenClaw metadata declares the canonical npm install path:
+  `openclaw.install.npmSpec=@unblocklabs/slack-subagent-card`,
+  `openclaw.install.defaultChoice=npm`,
+  `openclaw.release.publishToNpm=true`, and
+  `openclaw.release.publishToClawHub=false`
 - tests pass
 - tests do not dirty tracked files before the version bump
 

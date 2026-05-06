@@ -71,6 +71,34 @@ if [[ "$CURRENT_VERSION" != "$PLUGIN_VERSION" ]]; then
   exit 1
 fi
 
+node -e "
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+const errors = [];
+const openclaw = pkg.openclaw ?? {};
+const install = openclaw.install ?? {};
+const release = openclaw.release ?? {};
+if (pkg.name !== '${PACKAGE_NAME}') {
+  errors.push('package.json name must be ${PACKAGE_NAME}');
+}
+if (install.npmSpec !== '${PACKAGE_NAME}') {
+  errors.push('openclaw.install.npmSpec must be ${PACKAGE_NAME}');
+}
+if (install.defaultChoice !== 'npm') {
+  errors.push('openclaw.install.defaultChoice must be npm');
+}
+if (release.publishToNpm !== true) {
+  errors.push('openclaw.release.publishToNpm must be true');
+}
+if (release.publishToClawHub !== false) {
+  errors.push('openclaw.release.publishToClawHub must be false');
+}
+if (errors.length > 0) {
+  for (const error of errors) console.error(error);
+  process.exit(1);
+}
+"
+
 if [[ "$CURRENT_VERSION" == "$VERSION" ]]; then
   echo "Current version is already ${VERSION}. Choose a new version." >&2
   exit 1

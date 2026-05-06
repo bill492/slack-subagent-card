@@ -27,7 +27,13 @@
       "./dist/index.js"
     ],
     "install": {
+      "npmSpec": "@unblocklabs/slack-subagent-card",
+      "defaultChoice": "npm",
       "minHostVersion": ">=2026.4.22"
+    },
+    "release": {
+      "publishToClawHub": false,
+      "publishToNpm": true
     },
     "compat": {
       "pluginApi": ">=2026.4.22",
