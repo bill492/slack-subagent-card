@@ -177,6 +177,7 @@ const TASK_LOOKUP_RETRY_MS = 250;
 const CARD_TEXT_PREFIX = "Sub-agent ";
 const SHARED_STATE_VERSION = 2;
 const MAX_TOOL_TASKS = 10;
+const TOOL_TASK_TITLE_MAX_CHARS = 96;
 const SLACK_THREAD_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^:]+):thread:(.+)$/;
 const SLACK_TOPIC_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^-]+)-topic-(.+)$/;
 
@@ -773,23 +774,21 @@ function createTrackedRun(params: {
 
 function buildToolTaskCards(toolCalls: readonly TrackedToolCall[]): Array<Record<string, unknown>> {
   return toolCalls.slice(-MAX_TOOL_TASKS).map((toolCall) => {
-    const task: Record<string, unknown> = {
+    return {
       type: "task_card",
       task_id: toolCall.id,
-      title: truncate(formatToolTaskTitle(toolCall), 80),
+      title: truncate(formatToolTaskTitle(toolCall), TOOL_TASK_TITLE_MAX_CHARS),
       status: toolCall.status,
     };
-    if (toolCall.detail) {
-      task.details = toRichText(truncate(toolCall.detail, BLOCK_TEXT_MAX_CHARS));
-    }
-    return task;
   });
 }
 
 function formatToolTaskTitle(toolCall: TrackedToolCall): string {
-  const title = `🛠️ ${toolCall.name}`;
+  const parts = [toolCall.name];
+  if (toolCall.detail) parts.push(toolCall.detail);
   const elapsed = toolCall.durationMs != null ? formatElapsed(Math.max(0, toolCall.durationMs)) : undefined;
-  return elapsed ? `${title} (${elapsed})` : title;
+  if (elapsed) parts.push(`(${elapsed})`);
+  return parts.join(" ");
 }
 
 function buildToolCallDetail(event: AfterToolCallEvent): string | undefined {
@@ -799,18 +798,16 @@ function buildToolCallDetail(event: AfterToolCallEvent): string | undefined {
   const toolName = asNonEmptyString(event.toolName)?.toLowerCase();
   if (toolName === "exec" || toolName === "bash" || toolName === "shell") {
     const command = firstString(params, ["cmd", "command", "script"]);
-    const cwd = firstString(params, ["cwd", "workdir"]);
-    return joinDetailParts([command, cwd ? `cwd: ${cwd}` : undefined]);
+    return command ? sanitizeToolDetail(command) : undefined;
   }
 
   if (toolName === "read" || toolName === "write" || toolName === "edit") {
-    return firstString(params, ["path", "file_path", "filepath", "file"]);
+    return sanitizeToolDetail(firstString(params, ["path", "file_path", "filepath", "file"]));
   }
 
   if (toolName === "rg" || toolName === "grep" || toolName === "search") {
     const query = firstString(params, ["pattern", "query", "q"]);
-    const target = firstString(params, ["path", "cwd", "workdir"]);
-    return joinDetailParts([query, target]);
+    return sanitizeToolDetail(query);
   }
 
   return summarizeToolParams(params);
@@ -834,12 +831,30 @@ function summarizeToolParams(params: Record<string, unknown>): string | undefine
   for (const [key, value] of Object.entries(params)) {
     if (parts.length >= 3) break;
     if (typeof value === "string" && value.trim()) {
-      parts.push(`${key}: ${value.trim()}`);
+      const sanitized = sanitizeToolDetail(value);
+      if (sanitized) parts.push(`${key}: ${sanitized}`);
     } else if (typeof value === "number" || typeof value === "boolean") {
       parts.push(`${key}: ${String(value)}`);
     }
   }
   return joinDetailParts(parts);
+}
+
+function sanitizeToolDetail(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  let sanitized = value.trim();
+  if (!sanitized) return undefined;
+
+  sanitized = sanitized
+    .replace(/\/Users\/[^\s"'`|;)]+/g, "~")
+    .replace(/\/private\/var\/folders\/[^\s"'`|;)]+/g, "<tmp>")
+    .replace(/\/var\/folders\/[^\s"'`|;)]+/g, "<tmp>")
+    .replace(/\/tmp\/[^\s"'`|;)]+/g, "<tmp>")
+    .replace(/\b[A-Za-z]:\\Users\\[^\s"'`|;)]+/g, "~")
+    .replace(/\\Users\\[^\s"'`|;)]+/g, "~")
+    .replace(/\s+/g, " ");
+
+  return sanitized || undefined;
 }
 
 function upsertTrackedToolCall(tracked: TrackedRun, toolCall: TrackedToolCall): void {

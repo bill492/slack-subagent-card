@@ -6,13 +6,15 @@ This plugin posts a Slack Block Kit `plan` card in the originating Slack thread 
 
 ## Version
 
-Current package version: **1.2.9**.
+Current package version: **1.2.10**.
 
-Version `1.2.9` refines compact sub-agent tool-call visualization:
+Version `1.2.10` tightens compact sub-agent tool-call rendering:
 
 - renders completed sub-agent summary tasks after the observed tool-call tasks
-- labels tool-call tasks with `🛠️` and includes hook-provided elapsed time when available
-- adds compact tool parameter context in task details without exposing tool output
+- renders tool-call context inline in compact task titles and includes hook-provided elapsed time when available
+- sanitizes local user and temporary paths from tool-call task titles without exposing tool output
+
+Version `1.2.9` refines compact sub-agent tool-call visualization:
 
 Version `1.2.8` adds compact sub-agent tool-call visualization:
 
