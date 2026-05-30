@@ -99,9 +99,11 @@ export type SubagentDeliveryTargetEvent = {
 
 export type AfterToolCallEvent = {
   toolName?: string;
+  params?: Record<string, unknown>;
   runId?: string;
   toolCallId?: string;
   error?: string;
+  durationMs?: number;
 };
 
 type BoundTaskRunsRuntime = {
@@ -152,6 +154,8 @@ type TrackedRun = {
 type TrackedToolCall = {
   id: string;
   name: string;
+  detail?: string;
+  durationMs?: number;
   status: "complete" | "error";
 };
 
@@ -433,6 +437,8 @@ export async function handleAfterToolCall(
   upsertTrackedToolCall(tracked, {
     id: buildToolCallTaskId(event, tracked),
     name: toolName,
+    detail: buildToolCallDetail(event),
+    durationMs: asFiniteNumber(event.durationMs),
     status: event.error ? "error" : "complete",
   });
 
@@ -653,12 +659,13 @@ function buildBlocks(params: {
   }
 
   const toolTasks = buildToolTaskCards(params.toolCalls ?? []);
+  const tasks = params.slackTaskStatus === "in_progress" ? [task, ...toolTasks] : [...toolTasks, task];
 
   return [
     {
       type: "plan",
       title: params.statusText,
-      tasks: [task, ...toolTasks],
+      tasks,
     },
   ];
 }
@@ -765,16 +772,74 @@ function createTrackedRun(params: {
 }
 
 function buildToolTaskCards(toolCalls: readonly TrackedToolCall[]): Array<Record<string, unknown>> {
-  return toolCalls.slice(-MAX_TOOL_TASKS).map((toolCall) => ({
-    type: "task_card",
-    task_id: toolCall.id,
-    title: truncate(formatToolTaskTitle(toolCall.name), 80),
-    status: toolCall.status,
-  }));
+  return toolCalls.slice(-MAX_TOOL_TASKS).map((toolCall) => {
+    const task: Record<string, unknown> = {
+      type: "task_card",
+      task_id: toolCall.id,
+      title: truncate(formatToolTaskTitle(toolCall), 80),
+      status: toolCall.status,
+    };
+    if (toolCall.detail) {
+      task.details = toRichText(truncate(toolCall.detail, BLOCK_TEXT_MAX_CHARS));
+    }
+    return task;
+  });
 }
 
-function formatToolTaskTitle(toolName: string): string {
-  return `Tool: ${toolName}`;
+function formatToolTaskTitle(toolCall: TrackedToolCall): string {
+  const title = `🛠️ ${toolCall.name}`;
+  const elapsed = toolCall.durationMs != null ? formatElapsed(Math.max(0, toolCall.durationMs)) : undefined;
+  return elapsed ? `${title} (${elapsed})` : title;
+}
+
+function buildToolCallDetail(event: AfterToolCallEvent): string | undefined {
+  const params = event.params;
+  if (!params || typeof params !== "object") return undefined;
+
+  const toolName = asNonEmptyString(event.toolName)?.toLowerCase();
+  if (toolName === "exec" || toolName === "bash" || toolName === "shell") {
+    const command = firstString(params, ["cmd", "command", "script"]);
+    const cwd = firstString(params, ["cwd", "workdir"]);
+    return joinDetailParts([command, cwd ? `cwd: ${cwd}` : undefined]);
+  }
+
+  if (toolName === "read" || toolName === "write" || toolName === "edit") {
+    return firstString(params, ["path", "file_path", "filepath", "file"]);
+  }
+
+  if (toolName === "rg" || toolName === "grep" || toolName === "search") {
+    const query = firstString(params, ["pattern", "query", "q"]);
+    const target = firstString(params, ["path", "cwd", "workdir"]);
+    return joinDetailParts([query, target]);
+  }
+
+  return summarizeToolParams(params);
+}
+
+function firstString(record: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const key of keys) {
+    const value = asNonEmptyString(record[key]);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function joinDetailParts(parts: readonly (string | undefined)[]): string | undefined {
+  const detail = parts.filter(Boolean).join(" · ");
+  return detail || undefined;
+}
+
+function summarizeToolParams(params: Record<string, unknown>): string | undefined {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(params)) {
+    if (parts.length >= 3) break;
+    if (typeof value === "string" && value.trim()) {
+      parts.push(`${key}: ${value.trim()}`);
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      parts.push(`${key}: ${String(value)}`);
+    }
+  }
+  return joinDetailParts(parts);
 }
 
 function upsertTrackedToolCall(tracked: TrackedRun, toolCall: TrackedToolCall): void {

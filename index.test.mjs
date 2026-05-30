@@ -149,8 +149,8 @@ describe("slack subagent card handlers", () => {
     assert.deepEqual(
       tasks.slice(1).map((task) => ({ title: task.title, status: task.status })),
       [
-        { title: "Tool: read", status: "complete" },
-        { title: "Tool: rg", status: "complete" },
+        { title: "🛠️ read", status: "complete" },
+        { title: "🛠️ rg", status: "complete" },
       ],
     );
   });
@@ -175,14 +175,21 @@ describe("slack subagent card handlers", () => {
     await handleAfterToolCall(
       harness.api,
       harness.shared,
-      { runId: "run-1234567890", toolName: "exec", toolCallId: "call-exec-1", error: "failed" },
+      {
+        runId: "run-1234567890",
+        toolName: "exec",
+        toolCallId: "call-exec-1",
+        params: { cmd: "npm test", cwd: "/repo" },
+        durationMs: 5200,
+        error: "failed",
+      },
       {},
     );
 
     const tasks = getTasks(harness.web.updates.at(-1));
-    assert.equal(tasks[1].title, "Tool: exec");
+    assert.equal(tasks[1].title, "🛠️ exec (5s)");
     assert.equal(tasks[1].status, "error");
-    assert.equal(tasks[1].details, undefined);
+    assert.equal(tasks[1].details.elements[0].elements[0].text, "npm test · cwd: /repo");
     assert.equal(tasks[1].output, undefined);
   });
 
@@ -264,9 +271,10 @@ describe("slack subagent card handlers", () => {
     );
 
     const tasks = getTasks(harness.web.updates.at(-1));
+    assert.equal(tasks[0].title, "🛠️ read");
     assert.equal(tasks[0].status, "complete");
-    assert.equal(tasks[1].title, "Tool: read");
     assert.equal(tasks[1].status, "complete");
+    assert.equal(tasks[1].title, "Preserve tools (just now)");
   });
 
   it("caps rendered tool-call tasks to the latest ten", async () => {
@@ -297,8 +305,8 @@ describe("slack subagent card handlers", () => {
 
     const tasks = getTasks(harness.web.updates.at(-1));
     assert.equal(tasks.length, 11);
-    assert.equal(tasks[1].title, "Tool: tool_3");
-    assert.equal(tasks.at(-1).title, "Tool: tool_12");
+    assert.equal(tasks[1].title, "🛠️ tool_3");
+    assert.equal(tasks.at(-1).title, "🛠️ tool_12");
   });
 
   it("keeps fallback tool task ids unique after capped calls without toolCallId", async () => {
@@ -387,7 +395,7 @@ describe("slack subagent card handlers", () => {
       );
 
       const tasks = getTasks(harness.web.updates.at(-1));
-      assert.equal(tasks[1].title, "Tool: read");
+      assert.equal(tasks[1].title, "🛠️ read");
       assert.equal(tasks[1].task_id, "tool-read-1");
     } finally {
       delete globalThis.__slackSubagentCardSharedState;
