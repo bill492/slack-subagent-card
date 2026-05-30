@@ -97,6 +97,13 @@ export type SubagentDeliveryTargetEvent = {
   expectsCompletionMessage?: boolean;
 };
 
+export type AfterToolCallEvent = {
+  toolName?: string;
+  runId?: string;
+  toolCallId?: string;
+  error?: string;
+};
+
 type BoundTaskRunsRuntime = {
   resolve: (token: string) => TaskRunDetail | undefined;
 };
@@ -138,6 +145,14 @@ type TrackedRun = {
   terminalUpdateQueued?: boolean;
   updateChain?: Promise<void>;
   initializing?: Promise<void>;
+  toolCalls: TrackedToolCall[];
+  nextToolTaskSequence: number;
+};
+
+type TrackedToolCall = {
+  id: string;
+  name: string;
+  status: "complete" | "error";
 };
 
 export type SharedState = {
@@ -157,6 +172,7 @@ const STALE_RUN_TTL_MS = 60 * 60 * 1000;
 const TASK_LOOKUP_RETRY_MS = 250;
 const CARD_TEXT_PREFIX = "Sub-agent ";
 const SHARED_STATE_VERSION = 2;
+const MAX_TOOL_TASKS = 10;
 const SLACK_THREAD_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^:]+):thread:(.+)$/;
 const SLACK_TOPIC_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^-]+)-topic-(.+)$/;
 
@@ -202,6 +218,19 @@ export function registerSlackSubagentCardHandlers(api: PluginApi, shared: Shared
     void handleDeliveryTarget(api, shared, event as SubagentDeliveryTargetEvent, ctx).catch((error) => {
       log.warn(`slack-subagent-card: subagent_delivery_target failed: ${stringifyError(error)}`);
     });
+  });
+
+  api.on("after_tool_call", async (event, ctx) => {
+    try {
+      const tool = event as AfterToolCallEvent;
+      const runId = asNonEmptyString(tool.runId ?? ctx.runId) ?? "unknown";
+      log.info(
+        `slack-subagent-card: after_tool_call fired — runId=${runId} toolName=${asNonEmptyString(tool.toolName) ?? "unknown"} status=${tool.error ? "error" : "complete"}`,
+      );
+      await handleAfterToolCall(api, shared, tool, ctx);
+    } catch (error) {
+      log.warn(`slack-subagent-card: after_tool_call failed: ${stringifyError(error)}`);
+    }
   });
 
   log.info("slack-subagent-card plugin registered");
@@ -364,6 +393,70 @@ export async function handleDeliveryTarget(
     api.logger.warn(
       `slack-subagent-card: early completion update failed for runId=${runId}: ${stringifyError(error)}`,
     );
+  }
+}
+
+export async function handleAfterToolCall(
+  api: PluginApi,
+  shared: SharedState,
+  event: AfterToolCallEvent,
+  ctx: HookContext,
+): Promise<void> {
+  const runId = asNonEmptyString(event.runId ?? ctx.runId);
+  if (!runId) {
+    api.logger.debug?.("slack-subagent-card: handleAfterToolCall skipped because runId is missing");
+    return;
+  }
+  if (runId.startsWith("codex-thread:")) {
+    api.logger.debug?.(`slack-subagent-card: handleAfterToolCall skipped Codex native runId=${runId}`);
+    return;
+  }
+
+  const tracked = shared.runs.get(runId);
+  if (!tracked) {
+    api.logger.debug?.(`slack-subagent-card: handleAfterToolCall missing tracked runId=${runId}`);
+    return;
+  }
+
+  await tracked.initializing?.catch(() => undefined);
+  if (!isPostedTrackedRun(tracked)) return;
+
+  const toolName = asNonEmptyString(event.toolName);
+  if (!toolName) {
+    api.logger.debug?.(`slack-subagent-card: handleAfterToolCall skipped because toolName is missing for runId=${runId}`);
+    return;
+  }
+
+  const web = await resolveSlackWebClient(api, shared, tracked.accountId);
+  if (!web) return;
+
+  upsertTrackedToolCall(tracked, {
+    id: buildToolCallTaskId(event, tracked),
+    name: toolName,
+    status: event.error ? "error" : "complete",
+  });
+
+  try {
+    await enqueueRunUpdate(tracked, async () => {
+      if (shared.runs.get(runId) !== tracked) return;
+
+      const task = resolveTaskRun(api, tracked.requesterSessionKey, runId);
+      const runningContent = buildRunningContent({
+        task,
+        runId,
+        mode: tracked.mode,
+      });
+
+      await updateSlackTaskCard({
+        web,
+        logger: api.logger,
+        tracked,
+        content: runningContent,
+        elapsedText: tracked.endedAt ? formatElapsed(Math.max(0, tracked.endedAt - tracked.startedAt)) : undefined,
+      });
+    });
+  } catch (error) {
+    api.logger.warn(`slack-subagent-card: tool call card update failed for runId=${runId}: ${stringifyError(error)}`);
   }
 }
 
@@ -539,6 +632,7 @@ function buildBlocks(params: {
   outputText?: string;
   taskId: string;
   slackTaskStatus: SlackTaskStatus;
+  toolCalls?: readonly TrackedToolCall[];
 }): Array<Record<string, unknown>> {
   const titleParts = [params.label];
   if (params.elapsedText) titleParts.push(`(${params.elapsedText})`);
@@ -558,11 +652,13 @@ function buildBlocks(params: {
     task.output = toRichText(truncate(params.outputText, BLOCK_TEXT_MAX_CHARS));
   }
 
+  const toolTasks = buildToolTaskCards(params.toolCalls ?? []);
+
   return [
     {
       type: "plan",
       title: params.statusText,
-      tasks: [task],
+      tasks: [task, ...toolTasks],
     },
   ];
 }
@@ -598,6 +694,7 @@ async function postSlackTaskCard(params: {
           outputText: params.content.outputText,
           taskId: params.content.taskId,
           slackTaskStatus: params.content.slackTaskStatus,
+          toolCalls: [],
         }) as any,
       }),
     params.logger,
@@ -637,6 +734,7 @@ async function updateSlackTaskCard(params: {
           outputText: params.content.outputText,
           taskId: params.content.taskId,
           slackTaskStatus: params.content.slackTaskStatus,
+          toolCalls: params.tracked.toolCalls,
         }) as any,
       }),
     params.logger,
@@ -661,7 +759,49 @@ function createTrackedRun(params: {
     requesterSessionKey: params.requesterSessionKey,
     deliveryRenderedTerminalTaskSignal: params.deliveryRenderedTerminalTaskSignal,
     deliveryUpdateSucceeded: params.deliveryUpdateSucceeded,
+    toolCalls: [],
+    nextToolTaskSequence: 0,
   };
+}
+
+function buildToolTaskCards(toolCalls: readonly TrackedToolCall[]): Array<Record<string, unknown>> {
+  return toolCalls.slice(-MAX_TOOL_TASKS).map((toolCall) => ({
+    type: "task_card",
+    task_id: toolCall.id,
+    title: truncate(formatToolTaskTitle(toolCall.name), 80),
+    status: toolCall.status,
+  }));
+}
+
+function formatToolTaskTitle(toolName: string): string {
+  return `Tool: ${toolName}`;
+}
+
+function upsertTrackedToolCall(tracked: TrackedRun, toolCall: TrackedToolCall): void {
+  const existingIndex = tracked.toolCalls.findIndex((candidate) => candidate.id === toolCall.id);
+  if (existingIndex >= 0) {
+    tracked.toolCalls[existingIndex] = toolCall;
+  } else {
+    tracked.toolCalls.push(toolCall);
+  }
+  if (tracked.toolCalls.length > MAX_TOOL_TASKS) {
+    tracked.toolCalls.splice(0, tracked.toolCalls.length - MAX_TOOL_TASKS);
+  }
+}
+
+function buildToolCallTaskId(event: AfterToolCallEvent, tracked: TrackedRun): string {
+  const raw = asNonEmptyString(event.toolCallId) ?? buildFallbackToolCallId(event, tracked);
+  return `tool-${sanitizeTaskId(raw)}`;
+}
+
+function buildFallbackToolCallId(event: AfterToolCallEvent, tracked: TrackedRun): string {
+  tracked.nextToolTaskSequence += 1;
+  return `${asNonEmptyString(event.toolName) ?? "tool"}-${tracked.nextToolTaskSequence}`;
+}
+
+function sanitizeTaskId(value: string): string {
+  const sanitized = value.trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return sanitized || "tool";
 }
 
 function isPostedTrackedRun(
@@ -1126,7 +1266,15 @@ function normalizeSharedState(shared: Partial<SharedState>): asserts shared is S
     shared.registeredApis = new WeakSet();
   }
   if (!(shared.webClients instanceof Map)) shared.webClients = new Map();
+  normalizeTrackedRuns(shared.runs);
   shared.stateVersion = SHARED_STATE_VERSION;
+}
+
+function normalizeTrackedRuns(runs: Map<string, TrackedRun>): void {
+  for (const tracked of runs.values()) {
+    tracked.toolCalls ??= [];
+    tracked.nextToolTaskSequence ??= tracked.toolCalls.length;
+  }
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

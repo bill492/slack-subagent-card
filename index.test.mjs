@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 
 import {
   createSharedState,
+  handleAfterToolCall,
   handleDeliveryTarget,
   handleEnded,
   handleSpawned,
@@ -110,6 +111,287 @@ describe("slack subagent card handlers", () => {
     assert.equal(getTask(harness.web.updates[0]).details.elements[0].elements[0].text, "Still gathering");
     assert.equal(getTask(harness.web.updates[1]).status, "complete");
     assert.equal(getTask(harness.web.updates[1]).details.elements[0].elements[0].text, "Final answer is ready");
+  });
+
+  it("appends compact tool-call tasks for tracked regular subagent runs", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Gather context",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
+      {},
+    );
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "rg", toolCallId: "call-rg-1" },
+      {},
+    );
+
+    const tasks = getTasks(harness.web.updates.at(-1));
+    assert.equal(tasks.length, 3);
+    assert.equal(tasks[0].title, "Gather context");
+    assert.deepEqual(
+      tasks.slice(1).map((task) => ({ title: task.title, status: task.status })),
+      [
+        { title: "Tool: read", status: "complete" },
+        { title: "Tool: rg", status: "complete" },
+      ],
+    );
+  });
+
+  it("marks tool-call tasks as error when after_tool_call reports an error", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Run command",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "exec", toolCallId: "call-exec-1", error: "failed" },
+      {},
+    );
+
+    const tasks = getTasks(harness.web.updates.at(-1));
+    assert.equal(tasks[1].title, "Tool: exec");
+    assert.equal(tasks[1].status, "error");
+    assert.equal(tasks[1].details, undefined);
+    assert.equal(tasks[1].output, undefined);
+  });
+
+  it("ignores after_tool_call events without a tracked non-Codex run", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Ignored tools",
+        status: "running",
+      },
+    });
+
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-missing", toolName: "read", toolCallId: "call-read-1" },
+      {},
+    );
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { toolName: "read", toolCallId: "call-read-2" },
+      {},
+    );
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "codex-thread:child", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "codex-thread:child", toolName: "exec", toolCallId: "call-exec-1" },
+      {},
+    );
+
+    assert.equal(harness.web.updates.length, 0);
+    assert.equal(getTasks(harness.web.posts[0]).length, 1);
+  });
+
+  it("preserves tool-call tasks across terminal updates", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Preserve tools",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
+      {},
+    );
+
+    harness.currentTask = {
+      id: "task-1234567890",
+      runId: "run-1234567890",
+      title: "Preserve tools",
+      status: "succeeded",
+      publicTerminalSummary: "Done",
+    };
+    await handleEnded(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", outcome: "ok" },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    const tasks = getTasks(harness.web.updates.at(-1));
+    assert.equal(tasks[0].status, "complete");
+    assert.equal(tasks[1].title, "Tool: read");
+    assert.equal(tasks[1].status, "complete");
+  });
+
+  it("caps rendered tool-call tasks to the latest ten", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Many tools",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    for (let index = 1; index <= 12; index += 1) {
+      await handleAfterToolCall(
+        harness.api,
+        harness.shared,
+        { runId: "run-1234567890", toolName: `tool_${index}`, toolCallId: `call-${index}` },
+        {},
+      );
+    }
+
+    const tasks = getTasks(harness.web.updates.at(-1));
+    assert.equal(tasks.length, 11);
+    assert.equal(tasks[1].title, "Tool: tool_3");
+    assert.equal(tasks.at(-1).title, "Tool: tool_12");
+  });
+
+  it("keeps fallback tool task ids unique after capped calls without toolCallId", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Fallback ids",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    for (let index = 1; index <= 12; index += 1) {
+      await handleAfterToolCall(
+        harness.api,
+        harness.shared,
+        { runId: "run-1234567890", toolName: "exec" },
+        {},
+      );
+    }
+
+    const tasks = getTasks(harness.web.updates.at(-1));
+    assert.equal(tasks.length, 11);
+    assert.deepEqual(
+      tasks.slice(1).map((task) => task.task_id),
+      [
+        "tool-exec-3",
+        "tool-exec-4",
+        "tool-exec-5",
+        "tool-exec-6",
+        "tool-exec-7",
+        "tool-exec-8",
+        "tool-exec-9",
+        "tool-exec-10",
+        "tool-exec-11",
+        "tool-exec-12",
+      ],
+    );
+  });
+
+  it("normalizes legacy tracked runs before recording tool-call tasks", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Legacy run",
+        status: "running",
+      },
+    });
+    const handlers = new Map();
+    harness.api.on = (hookName, handler) => {
+      handlers.set(hookName, handler);
+    };
+    const legacyShared = {
+      runs: new Map([
+        [
+          "run-legacy",
+          {
+            messageTs: "1700000000.000200",
+            channelId: "C123",
+            threadTs: "1700000000.000100",
+            startedAt: Date.now(),
+            label: "Legacy run",
+            requesterSessionKey: THREAD_SESSION_KEY,
+          },
+        ],
+      ]),
+      registeredApis: new WeakSet(),
+      webClients: new Map(),
+      stateVersion: 1,
+    };
+    globalThis.__slackSubagentCardSharedState = legacyShared;
+
+    try {
+      registerSlackSubagentCardHandlers(harness.api);
+      await handlers.get("after_tool_call")(
+        { runId: "run-legacy", toolName: "read" },
+        {},
+      );
+
+      const tasks = getTasks(harness.web.updates.at(-1));
+      assert.equal(tasks[1].title, "Tool: read");
+      assert.equal(tasks[1].task_id, "tool-read-1");
+    } finally {
+      delete globalThis.__slackSubagentCardSharedState;
+    }
   });
 
   it("backfills a completed card when delivery target arrives without spawned tracking", async () => {
@@ -300,6 +582,7 @@ describe("slack subagent card handlers", () => {
       "subagent_spawned",
       "subagent_ended",
       "subagent_delivery_target",
+      "after_tool_call",
     ]);
   });
 
@@ -579,6 +862,10 @@ function makeFakeWeb() {
 
 function getTask(payload) {
   return payload.blocks[0].tasks[0];
+}
+
+function getTasks(payload) {
+  return payload.blocks[0].tasks;
 }
 
 function deferred() {
