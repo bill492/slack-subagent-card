@@ -39,7 +39,10 @@ type SecretResolver = (params: {
 
 type SlackWebClient = {
   chat: {
+    appendStream?: (params: Record<string, unknown>) => Promise<unknown>;
     postMessage: (params: Record<string, unknown>) => Promise<unknown>;
+    startStream?: (params: Record<string, unknown>) => Promise<unknown>;
+    stopStream?: (params: Record<string, unknown>) => Promise<unknown>;
     update: (params: Record<string, unknown>) => Promise<unknown>;
   };
   conversations: {
@@ -59,6 +62,8 @@ type SlackRequester = {
   accountId?: string;
   to?: string;
   threadId?: string | number;
+  teamId?: string;
+  userId?: string;
 };
 
 export type HookContext = {
@@ -147,6 +152,10 @@ type TrackedRun = {
   terminalUpdateQueued?: boolean;
   updateChain?: Promise<void>;
   initializing?: Promise<void>;
+  renderMode: "blocks" | "stream";
+  streamFailed?: boolean;
+  streamFinalized?: boolean;
+  streamToolTaskCount: number;
   toolCalls: TrackedToolCall[];
   nextToolTaskSequence: number;
 };
@@ -169,6 +178,36 @@ export type SharedState = {
 type SlackThreadTarget = {
   channelId: string;
   threadTs: string;
+  recipientTeamId?: string;
+  recipientUserId?: string;
+};
+
+type SlackStreamChunk =
+  | {
+      type: "plan_update";
+      title: string;
+    }
+  | {
+      type: "task_update";
+      id: string;
+      title: string;
+      status: SlackTaskStatus;
+    };
+
+type SlackTaskCardContent = {
+  detail: string;
+  outputText?: string;
+  taskId: string;
+  slackTaskStatus: SlackTaskStatus;
+};
+
+type SlackTaskCardPayloadParams = {
+  elapsedText?: string;
+  fallbackStatusText?: string;
+  label: string;
+  statusText: string;
+  content: SlackTaskCardContent;
+  toolCalls?: readonly TrackedToolCall[];
 };
 
 const SHARED_STATE_KEY = "__slackSubagentCardSharedState";
@@ -177,6 +216,9 @@ const TASK_LOOKUP_RETRY_MS = 250;
 const CARD_TEXT_PREFIX = "Sub-agent ";
 const SHARED_STATE_VERSION = 2;
 const MAX_TOOL_TASKS = 10;
+const MAX_STREAM_TOOL_TASKS = 50;
+const STREAM_SUMMARY_TASK_ID = "stream-tool-summary";
+const STREAM_CHUNK_TEXT_MAX_CHARS = 256;
 const TOOL_TASK_TITLE_MAX_CHARS = 96;
 const SLACK_THREAD_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^:]+):thread:(.+)$/;
 const SLACK_TOPIC_RE = /^agent:[^:]+:slack:(?:channel|room|direct):([^-]+)-topic-(.+)$/;
@@ -303,25 +345,18 @@ export async function handleSpawned(
   const existing = shared.runs.get(runId);
   if (existing?.initializing) await existing.initializing.catch(() => undefined);
   if (!reserveTrackedRun(shared, runId, tracked)) return;
-  tracked.initializing = postSlackTaskCard({
+  tracked.initializing = initializeSlackTaskCard({
     web,
     logger: api.logger,
     target,
+    tracked,
     label: cardTitle,
     statusText: runningContent.statusText,
     fallbackStatusText: "SubAgent Running",
     content: runningContent,
+  }).then((trackedPosted) => {
+    if (!trackedPosted) cleanupTrackedRun(shared, runId, tracked);
   })
-    .then((messageTs) => {
-      if (!messageTs) {
-        api.logger.warn(`slack-subagent-card: postMessage returned no ts for runId=${runId}; skipping tracking`);
-        cleanupTrackedRun(shared, runId, tracked);
-        return;
-      }
-      tracked.messageTs = messageTs;
-      tracked.channelId = target.channelId;
-      tracked.threadTs = target.threadTs;
-    })
     .catch((error) => {
       cleanupTrackedRun(shared, runId, tracked);
       throw error;
@@ -332,7 +367,7 @@ export async function handleSpawned(
   await tracked.initializing;
 
   api.logger.debug?.(
-    `slack-subagent-card: posted card for runId=${runId} channel=${target.channelId} thread=${target.threadTs}`,
+    `slack-subagent-card: initialized ${tracked.renderMode} card for runId=${runId} channel=${target.channelId} thread=${target.threadTs}`,
   );
 }
 
@@ -384,12 +419,13 @@ export async function handleDeliveryTarget(
     await enqueueRunUpdate(tracked, async () => {
       if (!canApplyDeliveryUpdate(shared.runs.get(runId), tracked)) return;
 
-      await updateSlackTaskCard({
+      await renderTrackedRunUpdate({
         web,
         logger: api.logger,
         tracked,
         content: completionContent,
         elapsedText,
+        terminal: true,
       });
       tracked.deliveryUpdateSucceeded = true;
       tracked.deliveryRenderedTerminalTaskSignal = completionContent.usedTerminalTaskSignal;
@@ -454,7 +490,7 @@ export async function handleAfterToolCall(
         mode: tracked.mode,
       });
 
-      await updateSlackTaskCard({
+      await renderTrackedRunUpdate({
         web,
         logger: api.logger,
         tracked,
@@ -614,12 +650,13 @@ export async function handleEnded(
 
   try {
     await enqueueRunUpdate(tracked, async () => {
-      await updateSlackTaskCard({
+      await renderTrackedRunUpdate({
         web,
         logger: api.logger,
         tracked,
         content: terminalContent,
         elapsedText,
+        terminal: true,
       });
     });
   } catch (error) {
@@ -678,12 +715,7 @@ async function postSlackTaskCard(params: {
   label: string;
   statusText: string;
   fallbackStatusText?: string;
-  content: {
-    detail: string;
-    outputText?: string;
-    taskId: string;
-    slackTaskStatus: SlackTaskStatus;
-  };
+  content: SlackTaskCardContent;
 }): Promise<string | undefined> {
   params.logger.debug?.(
     `slack-subagent-card: posting card channel=${params.target.channelId} thread=${params.target.threadTs} taskId=${params.content.taskId} status=${params.content.slackTaskStatus} detailLen=${params.content.detail.length} outputLen=${params.content.outputText?.length ?? 0}`,
@@ -693,17 +725,12 @@ async function postSlackTaskCard(params: {
       params.web.chat.postMessage({
         channel: params.target.channelId,
         thread_ts: params.target.threadTs,
-        text: buildFallbackText(params.label, params.fallbackStatusText ?? params.statusText),
-        parse: "none",
-        blocks: buildBlocks({
+        ...buildSlackTaskCardPayload({
           label: params.label,
           statusText: params.statusText,
-          detail: params.content.detail,
-          outputText: params.content.outputText,
-          taskId: params.content.taskId,
-          slackTaskStatus: params.content.slackTaskStatus,
-          toolCalls: [],
-        }) as any,
+          fallbackStatusText: params.fallbackStatusText,
+          content: params.content,
+        }),
       }),
     params.logger,
   );
@@ -711,17 +738,58 @@ async function postSlackTaskCard(params: {
   return asNonEmptyString((sent as any)?.ts) ?? asNonEmptyString((sent as any)?.message?.ts);
 }
 
+async function initializeSlackTaskCard(params: {
+  web: SlackWebClient;
+  logger: Logger;
+  target: SlackThreadTarget;
+  tracked: TrackedRun;
+  label: string;
+  statusText: string;
+  fallbackStatusText?: string;
+  content: SlackTaskCardContent;
+}): Promise<boolean> {
+  const streamTs = await maybeStartSlackStream({
+    web: params.web,
+    logger: params.logger,
+    target: params.target,
+    statusText: params.statusText,
+  });
+
+  if (streamTs) {
+    params.tracked.renderMode = "stream";
+    params.tracked.messageTs = streamTs;
+    params.tracked.channelId = params.target.channelId;
+    params.tracked.threadTs = params.target.threadTs;
+    return true;
+  }
+
+  params.tracked.renderMode = "blocks";
+  const messageTs = await postSlackTaskCard({
+    web: params.web,
+    logger: params.logger,
+    target: params.target,
+    label: params.label,
+    statusText: params.statusText,
+    fallbackStatusText: params.fallbackStatusText,
+    content: params.content,
+  });
+
+  if (!messageTs) {
+    params.logger.warn("slack-subagent-card: postMessage returned no ts; skipping tracking");
+    return false;
+  }
+
+  params.tracked.messageTs = messageTs;
+  params.tracked.channelId = params.target.channelId;
+  params.tracked.threadTs = params.target.threadTs;
+  return true;
+}
+
 async function updateSlackTaskCard(params: {
   web: SlackWebClient;
   logger: Logger;
   tracked: TrackedRun & { messageTs: string; channelId: string };
-  content: {
-    statusText: string;
-    detail: string;
-    outputText?: string;
-    taskId: string;
-    slackTaskStatus: SlackTaskStatus;
-  };
+  content: SlackTaskCardContent & { statusText: string };
   elapsedText?: string;
 }): Promise<void> {
   params.logger.debug?.(
@@ -732,21 +800,200 @@ async function updateSlackTaskCard(params: {
       params.web.chat.update({
         channel: params.tracked.channelId,
         ts: params.tracked.messageTs,
-        text: buildFallbackText(params.tracked.label, params.content.statusText),
-        parse: "none",
-        blocks: buildBlocks({
+        ...buildSlackTaskCardPayload({
           label: params.tracked.label,
           statusText: params.content.statusText,
           elapsedText: params.elapsedText,
-          detail: params.content.detail,
-          outputText: params.content.outputText,
-          taskId: params.content.taskId,
-          slackTaskStatus: params.content.slackTaskStatus,
+          content: params.content,
           toolCalls: params.tracked.toolCalls,
-        }) as any,
+        }),
       }),
     params.logger,
   );
+}
+
+function buildSlackTaskCardPayload(params: SlackTaskCardPayloadParams): Record<string, unknown> {
+  return {
+    text: buildFallbackText(params.label, params.fallbackStatusText ?? params.statusText),
+    parse: "none",
+    blocks: buildBlocks({
+      label: params.label,
+      statusText: params.statusText,
+      elapsedText: params.elapsedText,
+      detail: params.content.detail,
+      outputText: params.content.outputText,
+      taskId: params.content.taskId,
+      slackTaskStatus: params.content.slackTaskStatus,
+      toolCalls: params.toolCalls ?? [],
+    }) as any,
+  };
+}
+
+async function renderTrackedRunUpdate(params: {
+  web: SlackWebClient;
+  logger: Logger;
+  tracked: TrackedRun & { messageTs: string; channelId: string };
+  content: SlackTaskCardContent & { statusText: string };
+  elapsedText?: string;
+  terminal?: boolean;
+}): Promise<void> {
+  if (params.tracked.renderMode === "stream" && !params.tracked.streamFailed) {
+    if (params.tracked.streamFinalized) {
+      if (params.terminal) {
+        await updateSlackTaskCard(params);
+      }
+      return;
+    }
+
+    try {
+      if (params.terminal) {
+        await finalizeSlackStream({
+          web: params.web,
+          logger: params.logger,
+          tracked: params.tracked,
+          content: params.content,
+          elapsedText: params.elapsedText,
+        });
+      } else {
+        await appendLatestToolCallToSlackStream({
+          web: params.web,
+          logger: params.logger,
+          tracked: params.tracked,
+        });
+      }
+      return;
+    } catch (error) {
+      params.logger.warn(
+        `slack-subagent-card: stream update failed; falling back to Block Kit update: ${stringifyError(error)}`,
+      );
+      params.tracked.renderMode = "blocks";
+      params.tracked.streamFailed = true;
+    }
+  }
+
+  await updateSlackTaskCard(params);
+}
+
+async function maybeStartSlackStream(params: {
+  web: SlackWebClient;
+  logger: Logger;
+  target: SlackThreadTarget;
+  statusText: string;
+}): Promise<string | undefined> {
+  if (typeof params.web.chat.startStream !== "function") {
+    params.logger.debug?.("slack-subagent-card: Slack streaming unavailable; using Block Kit card path");
+    return undefined;
+  }
+
+  const recipient = resolveStreamRecipient(params.target);
+  if (!recipient) {
+    params.logger.debug?.(
+      `slack-subagent-card: Slack stream recipient metadata missing for channel=${params.target.channelId}; using Block Kit card path`,
+    );
+    return undefined;
+  }
+
+  try {
+    const result = await withSlackRetry(
+      () =>
+        params.web.chat.startStream!({
+          channel: params.target.channelId,
+          thread_ts: params.target.threadTs,
+          task_display_mode: "plan",
+          chunks: [buildPlanUpdateChunk(params.statusText)],
+          ...recipient,
+        }),
+      params.logger,
+    );
+    const ts = asNonEmptyString((result as any)?.ts) ?? asNonEmptyString((result as any)?.message?.ts);
+    if (!ts) {
+      params.logger.warn("slack-subagent-card: chat.startStream returned no ts; using Block Kit card path");
+      return undefined;
+    }
+    params.logger.debug?.(
+      `slack-subagent-card: started Slack stream channel=${params.target.channelId} thread=${params.target.threadTs} ts=${ts}`,
+    );
+    return ts;
+  } catch (error) {
+    params.logger.warn(`slack-subagent-card: chat.startStream failed; using Block Kit card path: ${stringifyError(error)}`);
+    return undefined;
+  }
+}
+
+function resolveStreamRecipient(target: SlackThreadTarget): Record<string, string> | undefined {
+  const channelId = target.channelId;
+  const recipientUserId = asNonEmptyString(target.recipientUserId);
+  const recipientTeamId = asNonEmptyString(target.recipientTeamId);
+  if (/^[cg]/i.test(channelId)) {
+    return recipientUserId && recipientTeamId
+      ? { recipient_user_id: recipientUserId, recipient_team_id: recipientTeamId }
+      : undefined;
+  }
+  if (/^d/i.test(channelId)) {
+    return recipientUserId ? { recipient_user_id: recipientUserId } : undefined;
+  }
+  return undefined;
+}
+
+async function appendLatestToolCallToSlackStream(params: {
+  web: SlackWebClient;
+  logger: Logger;
+  tracked: TrackedRun & { messageTs: string; channelId: string };
+}): Promise<void> {
+  if (typeof params.web.chat.appendStream !== "function") {
+    throw new Error("chat.appendStream is unavailable");
+  }
+  const latest = params.tracked.toolCalls.at(-1);
+  if (!latest) return;
+
+  params.tracked.streamToolTaskCount += 1;
+  const chunks =
+    params.tracked.streamToolTaskCount <= MAX_STREAM_TOOL_TASKS
+      ? [buildToolTaskUpdateChunk(latest)]
+      : [buildStreamToolSummaryChunk(params.tracked.streamToolTaskCount)];
+
+  await withSlackRetry(
+    () =>
+      params.web.chat.appendStream!({
+        channel: params.tracked.channelId,
+        ts: params.tracked.messageTs,
+        chunks,
+      }),
+    params.logger,
+  );
+}
+
+async function finalizeSlackStream(params: {
+  web: SlackWebClient;
+  logger: Logger;
+  tracked: TrackedRun & { messageTs: string; channelId: string };
+  content: SlackTaskCardContent & { statusText: string };
+  elapsedText?: string;
+}): Promise<void> {
+  if (params.tracked.streamFinalized) return;
+  if (typeof params.web.chat.stopStream !== "function") {
+    throw new Error("chat.stopStream is unavailable");
+  }
+
+  const chunks = [
+    buildPlanUpdateChunk(params.content.statusText),
+    buildTerminalTaskUpdateChunk({
+      label: params.tracked.label,
+      elapsedText: params.elapsedText,
+      content: params.content,
+    }),
+  ];
+
+  await withSlackRetry(
+    () =>
+      params.web.chat.stopStream!({
+        channel: params.tracked.channelId,
+        ts: params.tracked.messageTs,
+        chunks,
+      }),
+    params.logger,
+  );
+  params.tracked.streamFinalized = true;
 }
 
 function createTrackedRun(params: {
@@ -767,6 +1014,8 @@ function createTrackedRun(params: {
     requesterSessionKey: params.requesterSessionKey,
     deliveryRenderedTerminalTaskSignal: params.deliveryRenderedTerminalTaskSignal,
     deliveryUpdateSucceeded: params.deliveryUpdateSucceeded,
+    renderMode: "blocks",
+    streamToolTaskCount: 0,
     toolCalls: [],
     nextToolTaskSequence: 0,
   };
@@ -783,12 +1032,56 @@ function buildToolTaskCards(toolCalls: readonly TrackedToolCall[]): Array<Record
   });
 }
 
+function buildPlanUpdateChunk(title: string): SlackStreamChunk {
+  return {
+    type: "plan_update",
+    title: truncate(normalizeSingleLine(title), STREAM_CHUNK_TEXT_MAX_CHARS),
+  };
+}
+
+function buildToolTaskUpdateChunk(toolCall: TrackedToolCall): SlackStreamChunk {
+  return {
+    type: "task_update",
+    id: sanitizeTaskId(toolCall.id),
+    title: truncate(normalizeSingleLine(formatToolTaskTitle(toolCall)), STREAM_CHUNK_TEXT_MAX_CHARS),
+    status: toolCall.status,
+  };
+}
+
+function buildStreamToolSummaryChunk(toolCount: number): SlackStreamChunk {
+  return {
+    type: "task_update",
+    id: STREAM_SUMMARY_TASK_ID,
+    title: truncate(`${toolCount} tool calls observed; latest details kept in the final card`, STREAM_CHUNK_TEXT_MAX_CHARS),
+    status: "in_progress",
+  };
+}
+
+function buildTerminalTaskUpdateChunk(params: {
+  label: string;
+  elapsedText?: string;
+  content: SlackTaskCardContent;
+}): SlackStreamChunk {
+  const titleParts = [params.label];
+  if (params.elapsedText) titleParts.push(`(${params.elapsedText})`);
+  return {
+    type: "task_update",
+    id: sanitizeTaskId(params.content.taskId),
+    title: truncate(normalizeSingleLine(titleParts.join(" ")), STREAM_CHUNK_TEXT_MAX_CHARS),
+    status: params.content.slackTaskStatus,
+  };
+}
+
 function formatToolTaskTitle(toolCall: TrackedToolCall): string {
   const parts = [toolCall.name];
   if (toolCall.detail) parts.push(toolCall.detail);
   const elapsed = toolCall.durationMs != null ? formatElapsed(Math.max(0, toolCall.durationMs)) : undefined;
   if (elapsed) parts.push(`(${elapsed})`);
-  return parts.join(" ");
+  return normalizeSingleLine(parts.join(" "));
+}
+
+function normalizeSingleLine(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function buildToolCallDetail(event: AfterToolCallEvent): string | undefined {
@@ -994,14 +1287,20 @@ async function resolveSlackThreadTarget(
 ): Promise<SlackThreadTarget | null> {
   const fromSession = parseSlackThreadSessionKey(requesterSessionKey);
   if (fromSession) {
+    const recipient = resolveRequesterStreamRecipient(requester, fromSession.channelId);
     // For DM sessions the captured ID is a user ID (U...), not a DM channel (D...).
     // Slack's chat.postMessage needs the D-prefixed channel ID for thread replies.
     if (/^U/i.test(fromSession.channelId)) {
       const resolved = await resolveUserToDmChannel(web, fromSession.channelId, log);
       if (!resolved) return null;
-      return { channelId: resolved, threadTs: fromSession.threadTs };
+      return {
+        channelId: resolved,
+        threadTs: fromSession.threadTs,
+        recipientTeamId: recipient.recipientTeamId,
+        recipientUserId: recipient.recipientUserId ?? fromSession.channelId.toUpperCase(),
+      };
     }
-    return fromSession;
+    return { ...fromSession, ...recipient };
   }
 
   const rawTarget = asNonEmptyString(requester?.to);
@@ -1009,13 +1308,28 @@ async function resolveSlackThreadTarget(
   if (!rawTarget || !threadTs) return null;
 
   let channelId = normalizeSlackChannelId(stripSlackTargetPrefix(rawTarget));
+  const recipient = resolveRequesterStreamRecipient(requester, channelId);
   if (/^U/i.test(channelId)) {
     const resolved = await resolveUserToDmChannel(web, channelId, log);
     if (!resolved) return null;
+    recipient.recipientUserId ??= channelId.toUpperCase();
     channelId = resolved;
   }
 
-  return { channelId, threadTs };
+  return { channelId, threadTs, ...recipient };
+}
+
+function resolveRequesterStreamRecipient(
+  requester: SlackRequester | undefined,
+  fallbackUserId?: string,
+): Pick<SlackThreadTarget, "recipientTeamId" | "recipientUserId"> {
+  const recipientUserId =
+    asNonEmptyString(requester?.userId) ??
+    (/^U/i.test(fallbackUserId ?? "") ? normalizeSlackChannelId(fallbackUserId!) : undefined);
+  return {
+    recipientTeamId: asNonEmptyString(requester?.teamId),
+    recipientUserId,
+  };
 }
 
 function parseSlackThreadSessionKey(sessionKey: string): SlackThreadTarget | null {
@@ -1352,6 +1666,8 @@ function normalizeSharedState(shared: Partial<SharedState>): asserts shared is S
 
 function normalizeTrackedRuns(runs: Map<string, TrackedRun>): void {
   for (const tracked of runs.values()) {
+    tracked.renderMode ??= "blocks";
+    tracked.streamToolTaskCount ??= 0;
     tracked.toolCalls ??= [];
     tracked.nextToolTaskSequence ??= tracked.toolCalls.length;
   }
@@ -1519,6 +1835,8 @@ function summarizeRequester(requester: SlackRequester | undefined): string {
     `accountId=${asNonEmptyString(requester.accountId) ?? "default"}`,
     `to=${asNonEmptyString(requester.to) ?? "none"}`,
     `threadId=${asNonEmptyIdString(requester.threadId) ?? "none"}`,
+    `teamId=${asNonEmptyString(requester.teamId) ?? "none"}`,
+    `userId=${asNonEmptyString(requester.userId) ?? "none"}`,
   ].join(",");
 }
 

@@ -6,7 +6,16 @@ This plugin posts a Slack Block Kit `plan` card in the originating Slack thread 
 
 ## Version
 
-Current package version: **1.2.10**.
+Current package version: **1.2.11**.
+
+Version `1.2.11` adds Slack Thinking Steps streaming where the host supplies Slack stream recipient metadata:
+
+- starts Slack streams with `plan_update` chunks for live sub-agent cards
+- appends compact `task_update` chunks for regular OpenClaw sub-agent tool calls
+- finalizes the stream with the completed sub-agent task after observed tools
+- updates a finalized stream message if a later terminal lifecycle event overrides delivery
+- falls back to the static Block Kit card path when streaming is unavailable, missing required recipient metadata, or stream updates fail
+- keeps backfilled completed cards on the static Block Kit path
 
 Version `1.2.10` tightens compact sub-agent tool-call rendering:
 
@@ -65,11 +74,13 @@ The plugin registers these OpenClaw hooks:
 - `subagent_spawned`
 - `subagent_delivery_target`
 - `subagent_ended`
+- `after_tool_call`
 
 Behavior:
 
-- `subagent_spawned` posts the initial running card when the event or requester session key identifies a Slack thread.
-- `subagent_delivery_target` updates an existing card to completed when `expectsCompletionMessage=true`.
+- `subagent_spawned` starts a Slack Thinking Steps stream when stream APIs and required Slack recipient metadata are available; otherwise it posts the initial running Block Kit card when the event or requester session key identifies a Slack thread.
+- `after_tool_call` appends compact streamed task updates, or updates the fallback Block Kit card, for tracked regular OpenClaw sub-agent runs.
+- `subagent_delivery_target` finalizes an existing stream or updates an existing fallback card to completed when `expectsCompletionMessage=true`.
 - `subagent_delivery_target` can also backfill a completed card if no card was tracked yet but the delivery origin contains a Slack target and thread ID.
 - `subagent_ended` applies terminal outcomes such as `ok`, `error`, `timeout`, `killed`, `reset`, and `deleted`, then cleans up tracked run state.
 
@@ -134,6 +145,7 @@ Release guidance and guardrails live in [RELEASING.md](./RELEASING.md).
 
 ## Limitations
 
-- Cards do not stream intermediate sub-agent progress beyond lifecycle/task summaries exposed by OpenClaw.
+- Slack streaming requires stream-capable Slack APIs, `recipient_user_id` for DM streams, and both `recipient_user_id` and `recipient_team_id` for channel streams. Current OpenClaw sub-agent hook payloads expose Slack `channel`, `accountId`, `to`, and `threadId`; when required user/team metadata is absent, the plugin uses the static Block Kit fallback.
+- Streamed tool-call tasks are appended up to 50 individual tool calls; longer runs update a stable summary task while the static fallback card keeps the latest ten rendered tool tasks.
 - Cards do not currently attach Slack `sources` links.
 - The plugin has no user-facing config flags beyond Slack token resolution through host configuration.

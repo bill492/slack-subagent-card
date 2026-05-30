@@ -13,6 +13,12 @@ import {
 
 const THREAD_SESSION_KEY = "agent:test:slack:channel:C123:thread:1700000000.000100";
 const TOKEN = "xoxb-test-token";
+const STREAM_REQUESTER = {
+  to: "channel:C123",
+  threadId: "1700000000.000100",
+  teamId: "T123",
+  userId: "U123",
+};
 
 describe("plugin manifest", () => {
   it("declares startup activation for Slack hook registration", () => {
@@ -29,6 +35,328 @@ describe("plugin manifest", () => {
 });
 
 describe("slack subagent card handlers", () => {
+  it("streams plan and task chunks for tracked regular subagent runs when recipient metadata is available", async () => {
+    const harness = await spawnStreamedRun();
+
+    assert.equal(harness.web.posts.length, 0);
+    assert.equal(harness.web.starts.length, 1);
+    assert.deepEqual(harness.web.starts[0], {
+      channel: "C123",
+      thread_ts: "1700000000.000100",
+      task_display_mode: "plan",
+      recipient_team_id: "T123",
+      recipient_user_id: "U123",
+      chunks: [{ type: "plan_update", title: "⏳ SubAgent Running" }],
+    });
+
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      {
+        runId: "run-1234567890",
+        toolName: "exec",
+        toolCallId: "call-exec-1",
+        params: { cmd: "npm test /Users/bek/Desktop/openclaw-plugins/slack-subagent-card" },
+        durationMs: 5200,
+      },
+      {},
+    );
+
+    assert.deepEqual(harness.web.appends[0], {
+      channel: "C123",
+      ts: "1700000000.000200",
+      chunks: [
+        {
+          type: "task_update",
+          id: "tool-call-exec-1",
+          title: "exec npm test ~ (5s)",
+          status: "complete",
+        },
+      ],
+    });
+
+    harness.currentTask = {
+      id: "task-1234567890",
+      runId: "run-1234567890",
+      title: "Gather context",
+      status: "succeeded",
+      publicTerminalSummary: "Done",
+    };
+    await handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      { childRunId: "run-1234567890", expectsCompletionMessage: true },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.stops.length, 1);
+    assert.deepEqual(harness.web.stops[0], {
+      channel: "C123",
+      ts: "1700000000.000200",
+      chunks: [
+        { type: "plan_update", title: "✅ Completed" },
+        {
+          type: "task_update",
+          id: "task-1234567890",
+          title: "Gather context (just now)",
+          status: "complete",
+        },
+      ],
+    });
+    assert.equal(harness.web.updates.length, 0);
+  });
+
+  it("falls back to Block Kit updates when stream recipient metadata is missing", async () => {
+    const harness = await spawnStreamedRun({
+      event: {
+        requester: { to: "C123", threadId: "1700000000.000100" },
+      },
+    });
+
+    assert.equal(harness.web.starts.length, 0);
+    assert.equal(harness.web.posts.length, 1);
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
+      {},
+    );
+    assert.equal(harness.web.updates.length, 1);
+  });
+
+  it("falls back to Block Kit posting when stream start fails before delivery", async () => {
+    const harness = makeStreamHarness();
+    harness.web.onStart = async () => {
+      throw new Error("stream unavailable");
+    };
+
+    await spawnStreamedRun({ harness });
+
+    assert.equal(harness.web.starts.length, 1);
+    assert.equal(harness.web.posts.length, 1);
+  });
+
+  it("falls back to updating the stream message with Block Kit when appendStream fails", async () => {
+    const harness = await spawnStreamedRun();
+    harness.web.onAppend = async () => {
+      throw new Error("append failed");
+    };
+
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
+      {},
+    );
+
+    assert.equal(harness.web.appends.length, 1);
+    assert.equal(harness.web.updates.length, 1);
+    assert.equal(harness.web.updates[0].ts, "1700000000.000200");
+    assert.equal(getTasks(harness.web.updates[0])[1].title, "read");
+  });
+
+  it("deduplicates streamed delivery and ended terminal finalization", async () => {
+    const harness = await spawnStreamedRun({
+      task: {
+        title: "Race",
+        status: "succeeded",
+        publicTerminalSummary: "Done",
+      },
+    });
+
+    await handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      { childRunId: "run-1234567890", expectsCompletionMessage: true },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await handleEnded(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", outcome: "ok" },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.stops.length, 1);
+    assert.equal(harness.web.stops[0].chunks[1].title, "Race (just now)");
+  });
+
+  it("updates a finalized stream when a later terminal outcome overrides delivery", async () => {
+    const harness = await spawnStreamedRun({
+      task: {
+        title: "Race",
+        status: "running",
+        publicProgressSummary: "Still gathering",
+      },
+    });
+
+    await handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      { childRunId: "run-1234567890", expectsCompletionMessage: true },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    harness.currentTask = {
+      id: "task-1234567890",
+      runId: "run-1234567890",
+      title: "Race",
+      status: "failed",
+      publicError: "Boom",
+    };
+    await handleEnded(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", outcome: "error", error: "Boom" },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.stops.length, 1);
+    assert.equal(harness.web.stops[0].chunks[1].status, "complete");
+    assert.equal(harness.web.updates.length, 1);
+    assert.equal(harness.web.updates[0].ts, "1700000000.000200");
+    assert.equal(getTask(harness.web.updates[0]).status, "error");
+    assert.equal(getTask(harness.web.updates[0]).details.elements[0].elements[0].text, "Boom");
+  });
+
+  it("finalizes a streamed run from subagent_ended when delivery has not arrived", async () => {
+    const harness = await spawnStreamedRun({
+      task: {
+        title: "Ended only",
+        status: "failed",
+        error: "Tool failed",
+      },
+    });
+
+    await handleEnded(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", outcome: "error", error: "Tool failed" },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.stops.length, 1);
+    assert.deepEqual(harness.web.stops[0].chunks, [
+      { type: "plan_update", title: "❌ Failed" },
+      {
+        type: "task_update",
+        id: "task-1234567890",
+        title: "Ended only (just now)",
+        status: "error",
+      },
+    ]);
+    assert.equal(harness.shared.runs.has("run-1234567890"), false);
+  });
+
+  it("falls back to updating the stream message with Block Kit when stopStream fails", async () => {
+    const harness = await spawnStreamedRun({
+      task: {
+        title: "Stop fallback",
+        status: "succeeded",
+        publicTerminalSummary: "Done",
+      },
+    });
+
+    harness.web.onStop = async () => {
+      throw new Error("stop failed");
+    };
+
+    await handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      { childRunId: "run-1234567890", expectsCompletionMessage: true },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+
+    assert.equal(harness.web.stops.length, 1);
+    assert.equal(harness.web.updates.length, 1);
+    assert.equal(harness.web.updates[0].ts, "1700000000.000200");
+    assert.equal(getTask(harness.web.updates[0]).title, "Stop fallback (just now)");
+  });
+
+  it("streams direct-message session keys with the resolved DM channel and inferred recipient user", async () => {
+    const harness = await spawnStreamedRun({
+      task: { title: "Direct message" },
+      event: {},
+      context: {
+        requesterSessionKey: "agent:test:slack:direct:U999:thread:1700000000.000100",
+      },
+    });
+
+    assert.equal(harness.web.opens.length, 1);
+    assert.deepEqual(harness.web.starts[0], {
+      channel: "D999",
+      thread_ts: "1700000000.000100",
+      task_display_mode: "plan",
+      recipient_user_id: "U999",
+      chunks: [{ type: "plan_update", title: "⏳ SubAgent Running" }],
+    });
+    assert.equal(harness.web.posts.length, 0);
+  });
+
+  it("uses a stable summary task for long streamed tool-call runs", async () => {
+    const harness = await spawnStreamedRun({
+      task: {
+        title: "Many tools",
+      },
+    });
+
+    for (let index = 1; index <= 52; index += 1) {
+      await handleAfterToolCall(
+        harness.api,
+        harness.shared,
+        { runId: "run-1234567890", toolName: `tool_${index}`, toolCallId: `call-${index}` },
+        {},
+      );
+    }
+
+    assert.equal(harness.web.appends.length, 52);
+    assert.deepEqual(harness.web.appends[49].chunks[0], {
+      type: "task_update",
+      id: "tool-call-50",
+      title: "tool_50",
+      status: "complete",
+    });
+    assert.deepEqual(harness.web.appends.at(-1).chunks[0], {
+      type: "task_update",
+      id: "stream-tool-summary",
+      title: "52 tool calls observed; latest details kept in the final card",
+      status: "in_progress",
+    });
+  });
+
+  it("keeps backfilled completed cards on the static Block Kit path", async () => {
+    const harness = makeHarness({
+      stream: true,
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Backfill",
+        status: "succeeded",
+        publicTerminalSummary: "Done",
+      },
+    });
+
+    await handleDeliveryTarget(
+      harness.api,
+      harness.shared,
+      {
+        childRunId: "run-1234567890",
+        expectsCompletionMessage: true,
+        requesterSessionKey: "agent:test:main",
+        requesterOrigin: {
+          channel: "slack",
+          ...STREAM_REQUESTER,
+        },
+      },
+      { requesterSessionKey: "agent:test:main" },
+    );
+
+    assert.equal(harness.web.starts.length, 0);
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(getTask(harness.web.posts[0]).status, "complete");
+  });
+
   it("uses the tracked requester session key and escapes Slack fallback text", async () => {
     const { api, bindSessionKeys, shared, web } = makeHarness({
       task: {
@@ -802,8 +1130,8 @@ describe("slack subagent card handlers", () => {
   });
 });
 
-function makeHarness({ task }) {
-  const web = makeFakeWeb();
+function makeHarness({ task, stream = false }) {
+  const web = makeFakeWeb({ stream });
   const shared = createSharedState();
   shared.webClients.set(TOKEN, web);
 
@@ -846,11 +1174,53 @@ function makeHarness({ task }) {
   return harness;
 }
 
-function makeFakeWeb() {
+function makeStreamHarness(task = {}) {
+  return makeHarness({
+    stream: true,
+    task: {
+      id: "task-1234567890",
+      runId: "run-1234567890",
+      title: "Gather context",
+      status: "running",
+      ...task,
+    },
+  });
+}
+
+async function spawnStreamedRun({
+  harness,
+  event,
+  context = {},
+  task,
+} = {}) {
+  const activeHarness = harness ?? makeStreamHarness(task);
+  await handleSpawned(
+    activeHarness.api,
+    activeHarness.shared,
+    {
+      runId: "run-1234567890",
+      ...(event ?? { requester: STREAM_REQUESTER }),
+    },
+    {
+      requesterSessionKey: THREAD_SESSION_KEY,
+      ...context,
+    },
+  );
+  return activeHarness;
+}
+
+function makeFakeWeb({ stream = false } = {}) {
   const web = {
+    appends: [],
+    opens: [],
     posts: [],
+    starts: [],
+    stops: [],
     updates: [],
+    onAppend: undefined,
     onPost: undefined,
+    onStart: undefined,
+    onStop: undefined,
     onUpdate: undefined,
     chat: {
       async postMessage(payload) {
@@ -864,7 +1234,30 @@ function makeFakeWeb() {
         return { ok: true };
       },
     },
+    conversations: {
+      async open(payload) {
+        web.opens.push(payload);
+        return { ok: true, channel: { id: `D${String(payload.users).replace(/^U/, "")}` } };
+      },
+    },
   };
+  if (stream) {
+    web.chat.startStream = async (payload) => {
+      web.starts.push(payload);
+      if (web.onStart) return web.onStart(payload);
+      return { ok: true, ts: "1700000000.000200" };
+    };
+    web.chat.appendStream = async (payload) => {
+      web.appends.push(payload);
+      if (web.onAppend) return web.onAppend(payload);
+      return { ok: true };
+    };
+    web.chat.stopStream = async (payload) => {
+      web.stops.push(payload);
+      if (web.onStop) return web.onStop(payload);
+      return { ok: true };
+    };
+  }
   return web;
 }
 
