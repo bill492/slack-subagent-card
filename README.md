@@ -6,7 +6,18 @@ This plugin posts a Slack Block Kit `plan` card in the originating Slack thread 
 
 ## Version
 
-Current package version: **1.2.5**.
+Current package version: **1.2.9**.
+
+Version `1.2.9` republishes the compact sub-agent tool-call visualization with README package metadata aligned to the npm release.
+
+Version `1.2.8` adds compact sub-agent tool-call visualization:
+
+- registers `after_tool_call` alongside the sub-agent lifecycle hooks
+- appends one compact Slack `task_card` per observed regular OpenClaw sub-agent tool call
+- preserves tool-call tasks across completion and terminal card updates
+- caps rendered tool-call tasks to the latest ten calls
+
+Version `1.2.7` aligns the npm package and OpenClaw plugin manifest release metadata.
 
 Version `1.2.5` fixes typed hook registration with OpenClaw 2026.5.x plugin hosts:
 
