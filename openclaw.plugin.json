@@ -1,7 +1,7 @@
 {
   "id": "slack-subagent-card",
   "name": "Slack Subagent Card",
-  "version": "1.2.11",
+  "version": "1.2.12",
   "description": "Posts and updates a Slack Block Kit status card for sub-agent work in Slack threads.",
   "activation": {
     "onStartup": true,
