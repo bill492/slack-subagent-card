@@ -16,11 +16,19 @@ import {
 
 export type OpenClawConfig = {
   botToken?: unknown;
+  toolTasks?: {
+    enabled?: unknown;
+  };
   accounts?: Record<string, { botToken?: unknown }>;
   channels?: {
     slack?: {
       botToken?: unknown;
       accounts?: Record<string, { botToken?: unknown }>;
+      streaming?: {
+        preview?: {
+          toolProgress?: unknown;
+        };
+      };
     };
   };
 };
@@ -269,6 +277,7 @@ export function registerSlackSubagentCardHandlers(api: PluginApi, shared: Shared
 
   api.on("after_tool_call", async (event, ctx) => {
     try {
+      if (!areToolTasksEnabled(api)) return;
       const tool = event as AfterToolCallEvent;
       const runId = asNonEmptyString(tool.runId ?? ctx.runId) ?? "unknown";
       log.info(
@@ -443,6 +452,11 @@ export async function handleAfterToolCall(
   event: AfterToolCallEvent,
   ctx: HookContext,
 ): Promise<void> {
+  if (!areToolTasksEnabled(api)) {
+    api.logger.debug?.("slack-subagent-card: handleAfterToolCall skipped because tool task rendering is disabled");
+    return;
+  }
+
   const runId = asNonEmptyString(event.runId ?? ctx.runId);
   if (!runId) {
     api.logger.debug?.("slack-subagent-card: handleAfterToolCall skipped because runId is missing");
@@ -1070,6 +1084,14 @@ function buildTerminalTaskUpdateChunk(params: {
     title: truncate(normalizeSingleLine(titleParts.join(" ")), STREAM_CHUNK_TEXT_MAX_CHARS),
     status: params.content.slackTaskStatus,
   };
+}
+
+function areToolTasksEnabled(api: PluginApi): boolean {
+  const config = api.config;
+  if (config?.channels?.slack?.streaming?.preview?.toolProgress === false) {
+    return false;
+  }
+  return config?.toolTasks?.enabled === true;
 }
 
 function formatToolTaskTitle(toolCall: TrackedToolCall): string {

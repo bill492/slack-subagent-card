@@ -36,7 +36,7 @@ describe("plugin manifest", () => {
 
 describe("slack subagent card handlers", () => {
   it("streams plan and task chunks for tracked regular subagent runs when recipient metadata is available", async () => {
-    const harness = await spawnStreamedRun();
+    const harness = await spawnStreamedRun({ toolTasks: true });
 
     assert.equal(harness.web.posts.length, 0);
     assert.equal(harness.web.starts.length, 1);
@@ -108,6 +108,7 @@ describe("slack subagent card handlers", () => {
 
   it("falls back to Block Kit updates when stream recipient metadata is missing", async () => {
     const harness = await spawnStreamedRun({
+      toolTasks: true,
       event: {
         requester: { to: "C123", threadId: "1700000000.000100" },
       },
@@ -137,7 +138,7 @@ describe("slack subagent card handlers", () => {
   });
 
   it("falls back to updating the stream message with Block Kit when appendStream fails", async () => {
-    const harness = await spawnStreamedRun();
+    const harness = await spawnStreamedRun({ toolTasks: true });
     harness.web.onAppend = async () => {
       throw new Error("append failed");
     };
@@ -392,6 +393,7 @@ describe("slack subagent card handlers", () => {
 
   it("uses a stable summary task for long streamed tool-call runs", async () => {
     const harness = await spawnStreamedRun({
+      toolTasks: true,
       task: {
         title: "Many tools",
       },
@@ -546,6 +548,7 @@ describe("slack subagent card handlers", () => {
         status: "running",
       },
     });
+    enableToolTasks(harness);
 
     await handleSpawned(
       harness.api,
@@ -579,6 +582,72 @@ describe("slack subagent card handlers", () => {
     );
   });
 
+  it("does not render tool-call task cards by default", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Default hidden tools",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      {
+        runId: "run-1234567890",
+        toolName: "exec",
+        toolCallId: "call-exec-1",
+        params: { cmd: "ssh theo openclaw plugins install @unblocklabs/slack-subagent-card" },
+        durationMs: 5200,
+        error: "failed",
+      },
+      {},
+    );
+
+    assert.equal(harness.web.updates.length, 0);
+    assert.equal(getTasks(harness.web.posts[0]).length, 1);
+    assert.equal(getTasks(harness.web.posts[0])[0].title, "Default hidden tools");
+  });
+
+  it("does not render tool-call task cards when host Slack tool progress preview is disabled", async () => {
+    const harness = makeHarness({
+      config: {
+        toolTasks: { enabled: true },
+        channels: { slack: { streaming: { preview: { toolProgress: false } } } },
+      },
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Host disabled tools",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
+      {},
+    );
+
+    assert.equal(harness.web.updates.length, 0);
+    assert.equal(getTasks(harness.web.posts[0]).length, 1);
+  });
+
   it("marks tool-call tasks as error when after_tool_call reports an error", async () => {
     const harness = makeHarness({
       task: {
@@ -588,6 +657,7 @@ describe("slack subagent card handlers", () => {
         status: "running",
       },
     });
+    enableToolTasks(harness);
 
     await handleSpawned(
       harness.api,
@@ -666,6 +736,7 @@ describe("slack subagent card handlers", () => {
         status: "running",
       },
     });
+    enableToolTasks(harness);
 
     await handleSpawned(
       harness.api,
@@ -710,6 +781,7 @@ describe("slack subagent card handlers", () => {
         status: "running",
       },
     });
+    enableToolTasks(harness);
 
     await handleSpawned(
       harness.api,
@@ -742,6 +814,7 @@ describe("slack subagent card handlers", () => {
         status: "running",
       },
     });
+    enableToolTasks(harness);
 
     await handleSpawned(
       harness.api,
@@ -787,6 +860,7 @@ describe("slack subagent card handlers", () => {
         status: "running",
       },
     });
+    enableToolTasks(harness);
     const handlers = new Map();
     harness.api.on = (hookName, handler) => {
       handlers.set(hookName, handler);
@@ -1018,6 +1092,40 @@ describe("slack subagent card handlers", () => {
     ]);
   });
 
+  it("does not log or process after_tool_call events by default through the registered hook", async () => {
+    const harness = makeHarness({
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Default registered hook",
+        status: "running",
+      },
+    });
+    const handlers = new Map();
+    const infoMessages = [];
+    harness.api.logger.info = (message) => {
+      infoMessages.push(message);
+    };
+    harness.api.on = (hookName, handler) => {
+      handlers.set(hookName, handler);
+    };
+
+    registerSlackSubagentCardHandlers(harness.api);
+    await handlers.get("after_tool_call")(
+      {
+        runId: "run-1234567890",
+        toolName: "exec",
+        toolCallId: "call-exec-1",
+        params: { cmd: "ssh theo openclaw plugins install @unblocklabs/slack-subagent-card" },
+        error: "failed",
+      },
+      {},
+    );
+
+    assert.equal(harness.web.updates.length, 0);
+    assert.equal(infoMessages.some((message) => message.includes("after_tool_call fired")), false);
+  });
+
   it("skips registration when the host does not expose typed hooks", () => {
     const harness = makeHarness({
       task: {
@@ -1226,7 +1334,7 @@ describe("slack subagent card handlers", () => {
   });
 });
 
-function makeHarness({ task, stream = false }) {
+function makeHarness({ config, task, stream = false }) {
   const web = makeFakeWeb({ stream });
   const shared = createSharedState();
   shared.webClients.set(TOKEN, web);
@@ -1245,6 +1353,7 @@ function makeHarness({ task, stream = false }) {
       warn() {},
       debug() {},
     },
+    config,
     fallbackSlackWebClientFactory() {
       return web;
     },
@@ -1270,8 +1379,9 @@ function makeHarness({ task, stream = false }) {
   return harness;
 }
 
-function makeStreamHarness(task = {}) {
+function makeStreamHarness(task = {}, { config } = {}) {
   return makeHarness({
+    config,
     stream: true,
     task: {
       id: "task-1234567890",
@@ -1283,13 +1393,23 @@ function makeStreamHarness(task = {}) {
   });
 }
 
+function enableToolTasks(harness) {
+  harness.api.config = {
+    ...(harness.api.config ?? {}),
+    toolTasks: { enabled: true },
+  };
+  return harness;
+}
+
 async function spawnStreamedRun({
   harness,
   event,
   context = {},
   task,
+  toolTasks = false,
 } = {}) {
   const activeHarness = harness ?? makeStreamHarness(task);
+  if (toolTasks) enableToolTasks(activeHarness);
   await handleSpawned(
     activeHarness.api,
     activeHarness.shared,
