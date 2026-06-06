@@ -1353,7 +1353,7 @@ function parseSlackThreadSessionKey(sessionKey: string): SlackThreadTarget | nul
 }
 
 function stripSlackTargetPrefix(value: string): string {
-  return value.replace(/^(channel:|room:)/i, "");
+  return value.replace(/^(channel:|room:|user:)/i, "");
 }
 
 function hasSlackThreadTargetHint(

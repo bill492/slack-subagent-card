@@ -6,7 +6,12 @@ This plugin posts a Slack Block Kit `plan` card in the originating Slack thread 
 
 ## Version
 
-Current package version: **1.2.11**.
+Current package version: **1.2.12**.
+
+Version `1.2.12` fixes Slack direct-message requester target normalization:
+
+- strips `user:` prefixes from Slack requester targets before resolving DM channels
+- preserves existing `channel:`, `room:`, and bare Slack ID target handling
 
 Version `1.2.11` adds Slack Thinking Steps streaming where the host supplies Slack stream recipient metadata:
 

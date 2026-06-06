@@ -294,6 +294,102 @@ describe("slack subagent card handlers", () => {
     assert.equal(harness.web.posts.length, 0);
   });
 
+  for (const target of ["user:U123", "USER:U123"]) {
+    it(`normalizes requester DM target ${target} before resolving the Slack DM channel`, async () => {
+      const harness = makeStreamHarness({ title: "Requester DM" });
+      harness.web.conversations.open = async (payload) => {
+        harness.web.opens.push(payload);
+        return { ok: true };
+      };
+
+      await spawnStreamedRun({
+        harness,
+        task: { title: "Requester DM" },
+        event: {
+          requester: {
+            channel: "slack",
+            accountId: "default",
+            to: target,
+            threadId: "1700000000.000100",
+          },
+        },
+        context: {
+          requesterSessionKey: "agent:test:main",
+        },
+      });
+
+      assert.equal(harness.web.opens.length, 1);
+      assert.deepEqual(harness.web.opens[0], {
+        users: "U123",
+        return_im: true,
+      });
+      assert.equal(harness.web.starts.length, 0);
+      assert.equal(harness.web.posts.length, 0);
+    });
+  }
+
+  it("keeps bare requester DM target U123 valid and resolves it to a Slack DM channel", async () => {
+    const harness = await spawnStreamedRun({
+      task: { title: "Requester DM" },
+      event: {
+        requester: {
+          channel: "slack",
+          accountId: "default",
+          to: "U123",
+          threadId: "1700000000.000100",
+        },
+      },
+      context: {
+        requesterSessionKey: "agent:test:main",
+      },
+    });
+
+    assert.equal(harness.web.opens.length, 1);
+    assert.deepEqual(harness.web.opens[0], {
+      users: "U123",
+      return_im: true,
+    });
+    assert.deepEqual(harness.web.starts[0], {
+      channel: "D123",
+      thread_ts: "1700000000.000100",
+      task_display_mode: "plan",
+      recipient_user_id: "U123",
+      chunks: [{ type: "plan_update", title: "⏳ SubAgent Running" }],
+    });
+    assert.equal(harness.web.posts.length, 0);
+  });
+
+  for (const { target, expectedChannel } of [
+    { target: "channel:C123", expectedChannel: "C123" },
+    { target: "room:C123", expectedChannel: "C123" },
+    { target: "D123", expectedChannel: "D123" },
+    { target: "C123", expectedChannel: "C123" },
+    { target: "G123", expectedChannel: "G123" },
+  ]) {
+    it(`keeps requester channel target ${target} valid without DM lookup`, async () => {
+      const harness = await spawnStreamedRun({
+        task: { title: "Requester channel" },
+        event: {
+          requester: {
+            channel: "slack",
+            accountId: "default",
+            to: target,
+            threadId: "1700000000.000100",
+          },
+        },
+        context: {
+          requesterSessionKey: "agent:test:main",
+        },
+      });
+
+      assert.equal(harness.web.opens.length, 0);
+      assert.equal(harness.web.starts.length, 0);
+      assert.equal(harness.web.posts.length, 1);
+      assert.equal(harness.web.posts[0].channel, expectedChannel);
+      assert.equal(harness.web.posts[0].thread_ts, "1700000000.000100");
+    });
+  }
+
   it("uses a stable summary task for long streamed tool-call runs", async () => {
     const harness = await spawnStreamedRun({
       task: {
