@@ -620,13 +620,41 @@ describe("slack subagent card handlers", () => {
   it("does not render tool-call task cards when host Slack tool progress preview is disabled", async () => {
     const harness = makeHarness({
       config: {
-        toolTasks: { enabled: true },
         channels: { slack: { streaming: { preview: { toolProgress: false } } } },
       },
+      pluginConfig: { toolTasks: { enabled: true } },
       task: {
         id: "task-1234567890",
         runId: "run-1234567890",
         title: "Host disabled tools",
+        status: "running",
+      },
+    });
+
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
+      { requesterSessionKey: THREAD_SESSION_KEY },
+    );
+    await handleAfterToolCall(
+      harness.api,
+      harness.shared,
+      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
+      {},
+    );
+
+    assert.equal(harness.web.updates.length, 0);
+    assert.equal(getTasks(harness.web.posts[0]).length, 1);
+  });
+
+  it("does not treat root OpenClaw config as plugin-local tool task opt-in", async () => {
+    const harness = makeHarness({
+      config: { toolTasks: { enabled: true } },
+      task: {
+        id: "task-1234567890",
+        runId: "run-1234567890",
+        title: "Root config only",
         status: "running",
       },
     });
@@ -1334,7 +1362,7 @@ describe("slack subagent card handlers", () => {
   });
 });
 
-function makeHarness({ config, task, stream = false }) {
+function makeHarness({ config, pluginConfig, task, stream = false }) {
   const web = makeFakeWeb({ stream });
   const shared = createSharedState();
   shared.webClients.set(TOKEN, web);
@@ -1354,6 +1382,7 @@ function makeHarness({ config, task, stream = false }) {
       debug() {},
     },
     config,
+    pluginConfig,
     fallbackSlackWebClientFactory() {
       return web;
     },
@@ -1394,8 +1423,8 @@ function makeStreamHarness(task = {}, { config } = {}) {
 }
 
 function enableToolTasks(harness) {
-  harness.api.config = {
-    ...(harness.api.config ?? {}),
+  harness.api.pluginConfig = {
+    ...(harness.api.pluginConfig ?? {}),
     toolTasks: { enabled: true },
   };
   return harness;

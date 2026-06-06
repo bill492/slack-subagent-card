@@ -6,7 +6,13 @@ This plugin posts a Slack Block Kit `plan` card in the originating Slack thread 
 
 ## Version
 
-Current package version: **1.2.13**.
+Current package version: **1.2.14**.
+
+Version `1.2.14` fixes the `toolTasks.enabled` opt-in path:
+
+- reads plugin-local `toolTasks.enabled` from OpenClaw's plugin config surface
+- keeps root Slack preview config as the host-level override for tool progress
+- documents the full `plugins.entries.slack-subagent-card.config.toolTasks.enabled` config path
 
 Version `1.2.13` makes compact Slack tool-call task rows opt-in:
 
@@ -77,12 +83,20 @@ The plugin reads Slack bot tokens from these locations, in order:
 
 Configured secret references are resolved through OpenClaw's plugin SDK config runtime. If no token can be resolved, the plugin logs a warning and skips Slack card posting.
 
-Compact Slack rows for individual sub-agent tool calls are disabled by default. To opt in:
+Compact Slack rows for individual sub-agent tool calls are disabled by default. To opt in, set the plugin-local config:
 
 ```json
 {
-  "toolTasks": {
-    "enabled": true
+  "plugins": {
+    "entries": {
+      "slack-subagent-card": {
+        "config": {
+          "toolTasks": {
+            "enabled": true
+          }
+        }
+      }
+    }
   }
 }
 ```

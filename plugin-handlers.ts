@@ -16,9 +16,6 @@ import {
 
 export type OpenClawConfig = {
   botToken?: unknown;
-  toolTasks?: {
-    enabled?: unknown;
-  };
   accounts?: Record<string, { botToken?: unknown }>;
   channels?: {
     slack?: {
@@ -30,6 +27,12 @@ export type OpenClawConfig = {
         };
       };
     };
+  };
+};
+
+type OpenClawPluginConfig = {
+  toolTasks?: {
+    enabled?: unknown;
   };
 };
 
@@ -132,6 +135,7 @@ type PluginRuntimeTasks = {
 export type PluginApi = {
   logger: Logger;
   config?: OpenClawConfig;
+  pluginConfig?: OpenClawPluginConfig;
   createSlackWebClient?: (token: string) => SlackWebClient;
   fallbackSlackWebClientFactory?: (token: string) => SlackWebClient;
   resolveConfiguredSecretInputWithFallback?: SecretResolver;
@@ -1091,7 +1095,7 @@ function areToolTasksEnabled(api: PluginApi): boolean {
   if (config?.channels?.slack?.streaming?.preview?.toolProgress === false) {
     return false;
   }
-  return config?.toolTasks?.enabled === true;
+  return api.pluginConfig?.toolTasks?.enabled === true;
 }
 
 function formatToolTaskTitle(toolCall: TrackedToolCall): string {
