@@ -1,33 +1,20 @@
-import { sanitizeTaskText } from "./task-text-sanitizer.js";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+
+export { sanitizeTaskText } from "./task-text-sanitizer.js";
 
 export type Outcome = "ok" | "error" | "timeout" | "killed" | "reset" | "deleted";
 export type Mode = "run" | "session";
-export type TaskRunStatus = "queued" | "running" | "succeeded" | "failed" | "timed_out" | "cancelled" | "lost";
 export type SlackTaskStatus = "pending" | "in_progress" | "complete" | "error";
 
-export type TaskRunDetail = {
-  id: string;
-  runId?: string;
-  title: string;
-  label?: string;
-  status: TaskRunStatus;
-  deliveryStatus?: string;
-  notifyPolicy?: string;
-  progressSummary?: string;
-  terminalSummary?: string;
-  error?: string;
-  publicProgressSummary?: string;
-  publicTerminalSummary?: string;
-  publicError?: string;
-  redactedProgressSummary?: string;
-  redactedTerminalSummary?: string;
-  redactedError?: string;
-  terminalOutcome?: string;
-};
+type BoundTaskRunsRuntime = ReturnType<
+  OpenClawPluginApi["runtime"]["tasks"]["runs"]["bindSession"]
+>;
+
+/** Host-owned task detail returned by the supported plugin runtime API. */
+export type TaskRunDetail = NonNullable<ReturnType<BoundTaskRunsRuntime["resolve"]>>;
+export type TaskRunStatus = TaskRunDetail["status"];
 
 export const BLOCK_TEXT_MAX_CHARS = 300;
-export { sanitizeTaskText };
-
 const TERMINAL_TASK_STATUSES = new Set<TaskRunStatus>([
   "succeeded",
   "failed",
@@ -35,7 +22,6 @@ const TERMINAL_TASK_STATUSES = new Set<TaskRunStatus>([
   "cancelled",
   "lost",
 ]);
-const FAILURE_TASK_STATUSES = new Set<TaskRunStatus>(["failed", "timed_out", "cancelled", "lost"]);
 const TASK_STATUS_TEXT: Partial<Record<TaskRunStatus, string>> = {
   queued: "🟡 Queued",
   running: "⏳ SubAgent Running",
@@ -73,13 +59,10 @@ export function buildRunningContent(params: {
   taskId: string;
   slackTaskStatus: SlackTaskStatus;
 } {
-  const progressSummary = publicTaskText(params.task, "progressSummary");
   return {
     statusText: taskStatusToStatusText(params.task?.status) ?? "⏳ SubAgent Running",
-    detail: progressSummary ?? buildRunningDetail(params.mode),
-    outputText:
-      buildTaskMetadata(params.task, params.runId, { status: params.task?.status }) ??
-      buildRunningOutput(params.mode),
+    detail: buildRunningDetail(params.mode),
+    outputText: buildRunningOutput(params.mode),
     taskId: params.task?.id ?? params.runId,
     slackTaskStatus: taskStatusToSlackTaskStatus(params.task?.status) ?? "in_progress",
   };
@@ -90,7 +73,6 @@ export function buildTerminalContent(params: {
   runId: string;
   outcome: Outcome;
   elapsedText: string;
-  detail?: string;
   mode?: Mode;
 }): {
   statusText: string;
@@ -102,48 +84,29 @@ export function buildTerminalContent(params: {
   usedTerminalTaskSignal: boolean;
 } {
   const terminalTaskStatus = isTerminalTaskStatus(params.task?.status) ? params.task?.status : undefined;
-  const sanitizedDetail = sanitizeTaskText(params.detail, { errorContext: params.outcome !== "ok" });
-  const resolvedSummary = resolveTaskSummary(params.task, {
-    preferError: isFailureTaskStatus(terminalTaskStatus) || params.outcome === "error" || params.outcome === "timeout",
-    outcome: params.outcome,
+  const effectiveOutcome = taskStatusToOutcome(terminalTaskStatus) ?? params.outcome;
+  const detail = buildTerminalDetail({
+    outcome: effectiveOutcome,
+    elapsedText: params.elapsedText,
   });
-  const summary = resolvedSummary?.text ?? sanitizedDetail;
-  const detail =
-    summary ??
-    buildTerminalDetail({
-      outcome: params.outcome,
-      elapsedText: params.elapsedText,
-    });
-  const metadata = buildTaskMetadata(params.task, params.runId, { status: terminalTaskStatus });
-  const outputText = summary
-    ? metadata
-    : buildTerminalOutput({
-        outcome: params.outcome,
-        mode: params.mode,
-      });
+  const outputText = buildTerminalOutput({
+    outcome: effectiveOutcome,
+    mode: params.mode,
+  });
 
   return {
-    statusText: taskStatusToStatusText(terminalTaskStatus) ?? outcomeToStatus(params.outcome),
+    statusText: taskStatusToStatusText(terminalTaskStatus) ?? outcomeToStatus(effectiveOutcome),
     detail,
     outputText,
-    outcome: taskStatusToOutcome(terminalTaskStatus) ?? params.outcome,
+    outcome: effectiveOutcome,
     taskId: params.task?.id ?? params.runId,
-    slackTaskStatus: taskStatusToSlackTaskStatus(terminalTaskStatus) ?? outcomeToSlackTaskStatus(params.outcome),
-    usedTerminalTaskSignal:
-      Boolean(terminalTaskStatus) ||
-      resolvedSummary?.source === "terminalSummary" ||
-      (resolvedSummary?.source === "error" &&
-        (isFailureTaskStatus(terminalTaskStatus) || params.outcome === "error" || params.outcome === "timeout")) ||
-      Boolean(sanitizedDetail),
+    slackTaskStatus: taskStatusToSlackTaskStatus(terminalTaskStatus) ?? outcomeToSlackTaskStatus(effectiveOutcome),
+    usedTerminalTaskSignal: Boolean(terminalTaskStatus),
   };
 }
 
 export function hasTerminalTaskSignal(task: TaskRunDetail | undefined): boolean {
-  return (
-    isTerminalTaskStatus(task?.status) ||
-    Boolean(publicTaskText(task, "terminalSummary")) ||
-    Boolean(publicTaskText(task, "error", { errorContext: true, requireTerminalFailure: true }))
-  );
+  return isTerminalTaskStatus(task?.status);
 }
 
 function outcomeToSlackTaskStatus(outcome: Outcome | undefined): SlackTaskStatus {
@@ -159,65 +122,6 @@ function outcomeToSlackTaskStatus(outcome: Outcome | undefined): SlackTaskStatus
     default:
       return "in_progress";
   }
-}
-
-function resolveTaskSummary(
-  task: TaskRunDetail | undefined,
-  opts: { preferError?: boolean; outcome?: Outcome } = {},
-): { text: string; source: "terminalSummary" | "progressSummary" | "error" } | undefined {
-  const error = publicTaskText(task, "error", {
-    errorContext: true,
-    requireTerminalFailure: !(opts.outcome === "error" || opts.outcome === "timeout"),
-  });
-  const terminalSummary = publicTaskText(task, "terminalSummary", {
-    errorContext: isFailureTaskStatus(task?.status),
-  });
-  const progressSummary = publicTaskText(task, "progressSummary");
-
-  if (opts.preferError) {
-    if (error) return { text: error, source: "error" };
-    if (terminalSummary) return { text: terminalSummary, source: "terminalSummary" };
-    if (progressSummary) return { text: progressSummary, source: "progressSummary" };
-    return undefined;
-  }
-
-  if (terminalSummary) return { text: terminalSummary, source: "terminalSummary" };
-  if (progressSummary) return { text: progressSummary, source: "progressSummary" };
-  if (error) return { text: error, source: "error" };
-  return undefined;
-}
-
-function publicTaskText(
-  task: TaskRunDetail | undefined,
-  field: "progressSummary" | "terminalSummary" | "error",
-  opts: { errorContext?: boolean; requireTerminalFailure?: boolean } = {},
-): string | undefined {
-  if (!task) return undefined;
-  if (opts.requireTerminalFailure && !isFailureTaskStatus(task.status)) return undefined;
-
-  const prefix = field === "progressSummary" ? "ProgressSummary" : field === "terminalSummary" ? "TerminalSummary" : "Error";
-  const value =
-    task[`public${prefix}` as keyof TaskRunDetail] ??
-    task[`redacted${prefix}` as keyof TaskRunDetail];
-  return sanitizeTaskText(value, { errorContext: opts.errorContext, maxChars: BLOCK_TEXT_MAX_CHARS });
-}
-
-function buildTaskMetadata(
-  task: TaskRunDetail | undefined,
-  runId: string,
-  overrides: { status?: TaskRunStatus } = {},
-): string | undefined {
-  if (!task) return undefined;
-
-  const parts = [
-    `Task ${shortId(task.id)}`,
-    `run ${shortId(task.runId ?? runId)}`,
-    overrides.status ? `status ${overrides.status}` : undefined,
-    task.deliveryStatus ? `delivery ${task.deliveryStatus}` : undefined,
-    task.notifyPolicy ? `notify ${task.notifyPolicy}` : undefined,
-  ].filter((part): part is string => Boolean(part));
-
-  return truncate(parts.join(" · "), BLOCK_TEXT_MAX_CHARS);
 }
 
 function buildRunningDetail(mode?: Mode): string {
@@ -315,14 +219,6 @@ function isTerminalTaskStatus(status: TaskRunStatus | undefined): status is Task
   return Boolean(status && TERMINAL_TASK_STATUSES.has(status));
 }
 
-function isFailureTaskStatus(status: TaskRunStatus | undefined): boolean {
-  return Boolean(status && FAILURE_TASK_STATUSES.has(status));
-}
-
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
-}
-
-function shortId(value: string): string {
-  return value.length <= 12 ? value : value.slice(0, 12);
 }

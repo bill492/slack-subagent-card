@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "plugin": {
+    "id": "slack-subagent-card",
+    "priority": "high",
+    "seams": [
+      "plugin-runtime"
+    ],
+    "sourceRoot": ".",
+    "expect": {
+      "registrations": [
+        "definePluginEntry"
+      ],
+      "hooks": [
+        "after_tool_call",
+        "subagent_ended",
+        "subagent_progress",
+        "subagent_spawned"
+      ]
+    }
+  },
+  "capture": {
+    "runtime": true,
+    "mockSdk": true
+  }
+}

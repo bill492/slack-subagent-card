@@ -7,7 +7,12 @@
     "clean": "node -e \"fs.rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "release": "bash ./scripts/release.sh",
+    "plugin:ci": "plugin-inspector ci --no-openclaw --runtime --mock-sdk --allow-execute && node ./scripts/verify-inspector-report.mjs",
+    "pack:smoke": "node ./scripts/packed-install-smoke.mjs",
+    "preflight": "node ./scripts/preflight.mjs",
+    "release": "node ./scripts/release.mjs",
+    "metadata:check": "node ./scripts/release.mjs --metadata-check",
+    "release:test": "node --test ./scripts/*.test.mjs",
     "test": "npm run build && node --test task-card.test.mjs index.test.mjs",
     "prepack": "npm run build"
   },
@@ -15,8 +20,10 @@
     "@slack/web-api": "^7.15.0"
   },
   "devDependencies": {
+    "@openclaw/plugin-inspector": "0.3.18",
     "@types/node": "^22.0.0",
-    "openclaw": ">=2026.4.22",
+    "openclaw": "2026.7.2-beta.3",
+    "semver": "7.8.5",
     "typescript": "^5.9.0"
   },
   "openclaw": {
@@ -29,19 +36,19 @@
     "install": {
       "npmSpec": "@unblocklabs/slack-subagent-card",
       "defaultChoice": "npm",
-      "minHostVersion": ">=2026.4.22"
+      "minHostVersion": ">=2026.7.2-beta.3"
     },
     "release": {
       "publishToClawHub": false,
       "publishToNpm": true
     },
     "compat": {
-      "pluginApi": ">=2026.4.22",
-      "minGatewayVersion": ">=2026.4.22"
+      "pluginApi": ">=2026.7.2-beta.3",
+      "minGatewayVersion": ">=2026.7.2-beta.3"
     },
     "build": {
-      "openclawVersion": "2026.4.22",
-      "pluginSdkVersion": "2026.4.22"
+      "openclawVersion": "2026.7.2-beta.3",
+      "pluginSdkVersion": "2026.7.2-beta.3"
     }
   },
   "keywords": [
@@ -62,7 +69,7 @@
     "node": ">=22"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.4.22"
+    "openclaw": ">=2026.7.2-beta.3"
   },
   "peerDependenciesMeta": {
     "openclaw": {

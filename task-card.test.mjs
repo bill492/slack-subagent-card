@@ -1,59 +1,80 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { buildTerminalContent, sanitizeTaskText } from "./dist/task-card.js";
+import {
+  buildRunningContent,
+  buildTerminalContent,
+  sanitizeTaskText,
+} from "./dist/task-card.js";
+
+function createTaskRunDetail(overrides = {}) {
+  const runId = overrides.runId ?? "run-1234567890";
+  const createdAt = overrides.createdAt ?? 1_700_000_000_000;
+  return {
+    id: `task-${runId}`,
+    runtime: "subagent",
+    sessionKey: "agent:test:slack:channel:C123:thread:1700000000.000100",
+    ownerKey: "agent:test:slack:channel:C123:thread:1700000000.000100",
+    scope: "session",
+    childSessionKey: "agent:test:subagent:child",
+    agentId: "research-agent",
+    runId,
+    title: "Gather context",
+    status: "running",
+    deliveryStatus: "pending",
+    notifyPolicy: "done_only",
+    createdAt,
+    startedAt: createdAt + 10,
+    lastEventAt: createdAt + 20,
+    ...overrides,
+  };
+}
 
 describe("task-aware Slack card rendering", () => {
-  it("prefers task errors over stale progress summaries for failed tasks", () => {
-    const content = buildTerminalContent({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Investigate issue",
-        status: "failed",
-        publicProgressSummary: "Still checking files",
-        publicError: "Permission denied",
-      },
+  it("renders fixed generic copy instead of raw task progress, summaries, or errors", () => {
+    const secrets = [
+      "raw progress: workspace path /private/repo",
+      "raw terminal summary: copied user content",
+      "raw task error: SLACK_BOT_TOKEN=xoxb-private",
+    ];
+    const task = createTaskRunDetail({
+      id: "task-1234567890",
       runId: "run-1234567890",
+      title: "Investigate issue",
+      status: "failed",
+      deliveryStatus: "failed",
+      endedAt: 1_700_000_010_000,
+      progressSummary: secrets[0],
+      terminalSummary: secrets[1],
+      error: secrets[2],
+    });
+
+    const running = buildRunningContent({ task, runId: task.runId });
+    const terminal = buildTerminalContent({
+      task,
+      runId: task.runId,
       outcome: "error",
       elapsedText: "12s",
     });
+    const rendered = JSON.stringify({ running, terminal });
 
-    assert.equal(content.statusText, "❌ Failed");
-    assert.equal(content.detail, "Permission denied");
-    assert.equal(content.slackTaskStatus, "error");
-    assert.equal(content.usedTerminalTaskSignal, true);
+    assert.equal(running.detail, "A background worker is actively gathering results for this task.");
+    assert.equal(terminal.statusText, "❌ Failed");
+    assert.equal(terminal.detail, "The sub-agent failed after 12s.");
+    assert.equal(terminal.slackTaskStatus, "error");
+    assert.equal(terminal.usedTerminalTaskSignal, true);
+    for (const secret of secrets) assert.equal(rendered.includes(secret), false);
   });
 
   it("does not let a stale running task status override a terminal hook outcome", () => {
     const content = buildTerminalContent({
-      task: {
+      task: createTaskRunDetail({
         id: "task-1234567890",
         runId: "run-1234567890",
         title: "Gather context",
         status: "running",
-        publicProgressSummary: "Collected current state",
-      },
-      runId: "run-1234567890",
-      outcome: "ok",
-      elapsedText: "8s",
-    });
-
-    assert.equal(content.statusText, "✅ Completed");
-    assert.equal(content.detail, "Collected current state");
-    assert.equal(content.slackTaskStatus, "complete");
-    assert.equal(content.usedTerminalTaskSignal, false);
-  });
-
-  it("does not treat non-terminal task errors as successful terminal signals", () => {
-    const content = buildTerminalContent({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Retrying task",
-        status: "running",
-        publicError: "Earlier attempt failed",
-      },
+        progressSummary: "Collected sensitive current state",
+      }),
       runId: "run-1234567890",
       outcome: "ok",
       elapsedText: "8s",
@@ -61,28 +82,52 @@ describe("task-aware Slack card rendering", () => {
 
     assert.equal(content.statusText, "✅ Completed");
     assert.equal(content.detail, "Finished background work in 8s and handed the result back to the parent agent.");
+    assert.equal(content.slackTaskStatus, "complete");
     assert.equal(content.usedTerminalTaskSignal, false);
+    assert.equal(JSON.stringify(content).includes("Collected sensitive current state"), false);
   });
 
-  it("does not render raw task summaries unless they are explicitly public or redacted", () => {
+  it("uses an official terminal task status as the authoritative generic outcome", () => {
     const content = buildTerminalContent({
-      task: {
+      task: createTaskRunDetail({
         id: "task-1234567890",
         runId: "run-1234567890",
-        title: "Sensitive task",
+        title: "Completed task",
         status: "succeeded",
-        terminalSummary: "Raw summary with password: hunter2",
-      },
+        deliveryStatus: "delivered",
+        endedAt: 1_700_000_010_000,
+        terminalOutcome: "succeeded",
+      }),
       runId: "run-1234567890",
-      outcome: "ok",
+      outcome: "error",
       elapsedText: "5s",
     });
 
+    assert.equal(content.statusText, "✅ Completed");
+    assert.equal(content.outcome, "ok");
     assert.equal(content.detail, "Finished background work in 5s and handed the result back to the parent agent.");
+    assert.equal(content.slackTaskStatus, "complete");
     assert.equal(content.usedTerminalTaskSignal, true);
   });
 
-  it("strips internal task context and stack lines from error text", () => {
+  it("robustness: ignores unsupported raw hook error and reason properties at runtime", () => {
+    const content = buildTerminalContent({
+      runId: "run-1234567890",
+      outcome: "error",
+      elapsedText: "3s",
+      error: "private hook error",
+      reason: "private hook reason",
+      detail: "private unsupported detail",
+    });
+
+    assert.equal(content.detail, "The sub-agent failed after 3s.");
+    const rendered = JSON.stringify(content);
+    assert.equal(rendered.includes("private hook error"), false);
+    assert.equal(rendered.includes("private hook reason"), false);
+    assert.equal(rendered.includes("private unsupported detail"), false);
+  });
+
+  it("keeps the standalone sanitizer available for explicitly trusted future inputs", () => {
     const sanitized = sanitizeTaskText(
       [
         "User-facing failure.",
@@ -95,22 +140,6 @@ describe("task-aware Slack card rendering", () => {
     );
 
     assert.equal(sanitized, "User-facing failure.");
-  });
-
-  it("falls back to a generic terminal detail when raw detail is only internal text", () => {
-    const content = buildTerminalContent({
-      runId: "run-1234567890",
-      outcome: "error",
-      elapsedText: "3s",
-      detail: [
-        "OpenClaw runtime context (internal):",
-        "Keep internal details private.",
-        "sessionKey: agent:main:secret",
-        "at file:///repo/private.ts:12:3",
-      ].join("\n"),
-    });
-
-    assert.equal(content.detail, "The sub-agent failed after 3s.");
   });
 
   it("redacts common direct token formats and env assignments", () => {

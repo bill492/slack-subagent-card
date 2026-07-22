@@ -1,1517 +1,101 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
+  createBoundedSlackWebClient,
   createSharedState,
   handleAfterToolCall,
-  handleDeliveryTarget,
   handleEnded,
+  handleProgress,
   handleSpawned,
   registerSlackSubagentCardHandlers,
 } from "./dist/plugin-handlers.js";
 
 const THREAD_SESSION_KEY = "agent:test:slack:channel:C123:thread:1700000000.000100";
+const DM_SESSION_KEY = "agent:test:slack:direct:U123:thread:1700000000.000100";
+const CHILD_SESSION_KEY = "agent:test:subagent:child";
 const TOKEN = "xoxb-test-token";
-const STREAM_REQUESTER = {
-  to: "channel:C123",
-  threadId: "1700000000.000100",
-  teamId: "T123",
-  userId: "U123",
-};
 
-describe("plugin manifest", () => {
-  it("declares startup activation for Slack hook registration", () => {
-    const manifest = JSON.parse(
-      readFileSync(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
-    );
-
-    assert.deepEqual(manifest.activation, {
-      onStartup: true,
-      onChannels: ["slack"],
-      onCapabilities: ["hook"],
-    });
-  });
-});
-
-describe("slack subagent card handlers", () => {
-  it("streams plan and task chunks for tracked regular subagent runs when recipient metadata is available", async () => {
-    const harness = await spawnStreamedRun({ toolTasks: true });
-
-    assert.equal(harness.web.posts.length, 0);
-    assert.equal(harness.web.starts.length, 1);
-    assert.deepEqual(harness.web.starts[0], {
-      channel: "C123",
-      thread_ts: "1700000000.000100",
-      task_display_mode: "plan",
-      recipient_team_id: "T123",
-      recipient_user_id: "U123",
-      chunks: [{ type: "plan_update", title: "⏳ SubAgent Running" }],
-    });
-
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      {
-        runId: "run-1234567890",
-        toolName: "exec",
-        toolCallId: "call-exec-1",
-        params: { cmd: "npm test /Users/bek/Desktop/openclaw-plugins/slack-subagent-card" },
-        durationMs: 5200,
-      },
-      {},
-    );
-
-    assert.deepEqual(harness.web.appends[0], {
-      channel: "C123",
-      ts: "1700000000.000200",
-      chunks: [
-        {
-          type: "task_update",
-          id: "tool-call-exec-1",
-          title: "exec npm test ~ (5s)",
-          status: "complete",
-        },
-      ],
-    });
-
-    harness.currentTask = {
-      id: "task-1234567890",
-      runId: "run-1234567890",
-      title: "Gather context",
-      status: "succeeded",
-      publicTerminalSummary: "Done",
-    };
-    await handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      { childRunId: "run-1234567890", expectsCompletionMessage: true },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.stops.length, 1);
-    assert.deepEqual(harness.web.stops[0], {
-      channel: "C123",
-      ts: "1700000000.000200",
-      chunks: [
-        { type: "plan_update", title: "✅ Completed" },
-        {
-          type: "task_update",
-          id: "task-1234567890",
-          title: "Gather context (just now)",
-          status: "complete",
-        },
-      ],
-    });
-    assert.equal(harness.web.updates.length, 0);
-  });
-
-  it("falls back to Block Kit updates when stream recipient metadata is missing", async () => {
-    const harness = await spawnStreamedRun({
-      toolTasks: true,
-      event: {
-        requester: { to: "C123", threadId: "1700000000.000100" },
-      },
-    });
-
-    assert.equal(harness.web.starts.length, 0);
-    assert.equal(harness.web.posts.length, 1);
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
-      {},
-    );
-    assert.equal(harness.web.updates.length, 1);
-  });
-
-  it("falls back to Block Kit posting when stream start fails before delivery", async () => {
-    const harness = makeStreamHarness();
-    harness.web.onStart = async () => {
-      throw new Error("stream unavailable");
-    };
-
-    await spawnStreamedRun({ harness });
-
-    assert.equal(harness.web.starts.length, 1);
-    assert.equal(harness.web.posts.length, 1);
-  });
-
-  it("falls back to updating the stream message with Block Kit when appendStream fails", async () => {
-    const harness = await spawnStreamedRun({ toolTasks: true });
-    harness.web.onAppend = async () => {
-      throw new Error("append failed");
-    };
-
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
-      {},
-    );
-
-    assert.equal(harness.web.appends.length, 1);
-    assert.equal(harness.web.updates.length, 1);
-    assert.equal(harness.web.updates[0].ts, "1700000000.000200");
-    assert.equal(getTasks(harness.web.updates[0])[1].title, "read");
-  });
-
-  it("deduplicates streamed delivery and ended terminal finalization", async () => {
-    const harness = await spawnStreamedRun({
-      task: {
-        title: "Race",
-        status: "succeeded",
-        publicTerminalSummary: "Done",
-      },
-    });
-
-    await handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      { childRunId: "run-1234567890", expectsCompletionMessage: true },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await handleEnded(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", outcome: "ok" },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.stops.length, 1);
-    assert.equal(harness.web.stops[0].chunks[1].title, "Race (just now)");
-  });
-
-  it("updates a finalized stream when a later terminal outcome overrides delivery", async () => {
-    const harness = await spawnStreamedRun({
-      task: {
-        title: "Race",
-        status: "running",
-        publicProgressSummary: "Still gathering",
-      },
-    });
-
-    await handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      { childRunId: "run-1234567890", expectsCompletionMessage: true },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    harness.currentTask = {
-      id: "task-1234567890",
-      runId: "run-1234567890",
-      title: "Race",
-      status: "failed",
-      publicError: "Boom",
-    };
-    await handleEnded(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", outcome: "error", error: "Boom" },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.stops.length, 1);
-    assert.equal(harness.web.stops[0].chunks[1].status, "complete");
-    assert.equal(harness.web.updates.length, 1);
-    assert.equal(harness.web.updates[0].ts, "1700000000.000200");
-    assert.equal(getTask(harness.web.updates[0]).status, "error");
-    assert.equal(getTask(harness.web.updates[0]).details.elements[0].elements[0].text, "Boom");
-  });
-
-  it("finalizes a streamed run from subagent_ended when delivery has not arrived", async () => {
-    const harness = await spawnStreamedRun({
-      task: {
-        title: "Ended only",
-        status: "failed",
-        error: "Tool failed",
-      },
-    });
-
-    await handleEnded(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", outcome: "error", error: "Tool failed" },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.stops.length, 1);
-    assert.deepEqual(harness.web.stops[0].chunks, [
-      { type: "plan_update", title: "❌ Failed" },
-      {
-        type: "task_update",
-        id: "task-1234567890",
-        title: "Ended only (just now)",
-        status: "error",
-      },
-    ]);
-    assert.equal(harness.shared.runs.has("run-1234567890"), false);
-  });
-
-  it("falls back to updating the stream message with Block Kit when stopStream fails", async () => {
-    const harness = await spawnStreamedRun({
-      task: {
-        title: "Stop fallback",
-        status: "succeeded",
-        publicTerminalSummary: "Done",
-      },
-    });
-
-    harness.web.onStop = async () => {
-      throw new Error("stop failed");
-    };
-
-    await handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      { childRunId: "run-1234567890", expectsCompletionMessage: true },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.stops.length, 1);
-    assert.equal(harness.web.updates.length, 1);
-    assert.equal(harness.web.updates[0].ts, "1700000000.000200");
-    assert.equal(getTask(harness.web.updates[0]).title, "Stop fallback (just now)");
-  });
-
-  it("streams direct-message session keys with the resolved DM channel and inferred recipient user", async () => {
-    const harness = await spawnStreamedRun({
-      task: { title: "Direct message" },
-      event: {},
-      context: {
-        requesterSessionKey: "agent:test:slack:direct:U999:thread:1700000000.000100",
-      },
-    });
-
-    assert.equal(harness.web.opens.length, 1);
-    assert.deepEqual(harness.web.starts[0], {
-      channel: "D999",
-      thread_ts: "1700000000.000100",
-      task_display_mode: "plan",
-      recipient_user_id: "U999",
-      chunks: [{ type: "plan_update", title: "⏳ SubAgent Running" }],
-    });
-    assert.equal(harness.web.posts.length, 0);
-  });
-
-  for (const target of ["user:U123", "USER:U123"]) {
-    it(`normalizes requester DM target ${target} before resolving the Slack DM channel`, async () => {
-      const harness = makeStreamHarness({ title: "Requester DM" });
-      harness.web.conversations.open = async (payload) => {
-        harness.web.opens.push(payload);
-        return { ok: true };
-      };
-
-      await spawnStreamedRun({
-        harness,
-        task: { title: "Requester DM" },
-        event: {
-          requester: {
-            channel: "slack",
-            accountId: "default",
-            to: target,
-            threadId: "1700000000.000100",
-          },
-        },
-        context: {
-          requesterSessionKey: "agent:test:main",
-        },
-      });
-
-      assert.equal(harness.web.opens.length, 1);
-      assert.deepEqual(harness.web.opens[0], {
-        users: "U123",
-        return_im: true,
-      });
-      assert.equal(harness.web.starts.length, 0);
-      assert.equal(harness.web.posts.length, 0);
-    });
-  }
-
-  it("keeps bare requester DM target U123 valid and resolves it to a Slack DM channel", async () => {
-    const harness = await spawnStreamedRun({
-      task: { title: "Requester DM" },
-      event: {
-        requester: {
-          channel: "slack",
-          accountId: "default",
-          to: "U123",
-          threadId: "1700000000.000100",
-        },
-      },
-      context: {
-        requesterSessionKey: "agent:test:main",
-      },
-    });
-
-    assert.equal(harness.web.opens.length, 1);
-    assert.deepEqual(harness.web.opens[0], {
-      users: "U123",
-      return_im: true,
-    });
-    assert.deepEqual(harness.web.starts[0], {
-      channel: "D123",
-      thread_ts: "1700000000.000100",
-      task_display_mode: "plan",
-      recipient_user_id: "U123",
-      chunks: [{ type: "plan_update", title: "⏳ SubAgent Running" }],
-    });
-    assert.equal(harness.web.posts.length, 0);
-  });
-
-  for (const { target, expectedChannel } of [
-    { target: "channel:C123", expectedChannel: "C123" },
-    { target: "room:C123", expectedChannel: "C123" },
-    { target: "D123", expectedChannel: "D123" },
-    { target: "C123", expectedChannel: "C123" },
-    { target: "G123", expectedChannel: "G123" },
-  ]) {
-    it(`keeps requester channel target ${target} valid without DM lookup`, async () => {
-      const harness = await spawnStreamedRun({
-        task: { title: "Requester channel" },
-        event: {
-          requester: {
-            channel: "slack",
-            accountId: "default",
-            to: target,
-            threadId: "1700000000.000100",
-          },
-        },
-        context: {
-          requesterSessionKey: "agent:test:main",
-        },
-      });
-
-      assert.equal(harness.web.opens.length, 0);
-      assert.equal(harness.web.starts.length, 0);
-      assert.equal(harness.web.posts.length, 1);
-      assert.equal(harness.web.posts[0].channel, expectedChannel);
-      assert.equal(harness.web.posts[0].thread_ts, "1700000000.000100");
-    });
-  }
-
-  it("uses a stable summary task for long streamed tool-call runs", async () => {
-    const harness = await spawnStreamedRun({
-      toolTasks: true,
-      task: {
-        title: "Many tools",
-      },
-    });
-
-    for (let index = 1; index <= 52; index += 1) {
-      await handleAfterToolCall(
-        harness.api,
-        harness.shared,
-        { runId: "run-1234567890", toolName: `tool_${index}`, toolCallId: `call-${index}` },
-        {},
-      );
-    }
-
-    assert.equal(harness.web.appends.length, 52);
-    assert.deepEqual(harness.web.appends[49].chunks[0], {
-      type: "task_update",
-      id: "tool-call-50",
-      title: "tool_50",
-      status: "complete",
-    });
-    assert.deepEqual(harness.web.appends.at(-1).chunks[0], {
-      type: "task_update",
-      id: "stream-tool-summary",
-      title: "52 tool calls observed; latest details kept in the final card",
-      status: "in_progress",
-    });
-  });
-
-  it("keeps backfilled completed cards on the static Block Kit path", async () => {
-    const harness = makeHarness({
-      stream: true,
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Backfill",
-        status: "succeeded",
-        publicTerminalSummary: "Done",
-      },
-    });
-
-    await handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      {
-        childRunId: "run-1234567890",
-        expectsCompletionMessage: true,
-        requesterSessionKey: "agent:test:main",
-        requesterOrigin: {
-          channel: "slack",
-          ...STREAM_REQUESTER,
-        },
-      },
-      { requesterSessionKey: "agent:test:main" },
-    );
-
-    assert.equal(harness.web.starts.length, 0);
-    assert.equal(harness.web.posts.length, 1);
-    assert.equal(getTask(harness.web.posts[0]).status, "complete");
-  });
-
-  it("uses the tracked requester session key and escapes Slack fallback text", async () => {
-    const { api, bindSessionKeys, shared, web } = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Investigate",
-        label: "<!channel>",
-        status: "succeeded",
-        publicTerminalSummary: "Done",
-      },
-    });
-
-    await handleSpawned(
-      api,
-      shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    await handleDeliveryTarget(
-      api,
-      shared,
-      {
-        childRunId: "run-1234567890",
-        expectsCompletionMessage: true,
-        requesterSessionKey: "agent:test:slack:channel:C999:thread:999",
-      },
-      { requesterSessionKey: "agent:test:slack:channel:C888:thread:888" },
-    );
-
-    assert.deepEqual(bindSessionKeys, [THREAD_SESSION_KEY, THREAD_SESSION_KEY]);
-    assert.equal(web.posts[0].text, "Sub-agent &lt;!channel&gt;: SubAgent Running");
-    assert.equal(web.posts[0].parse, "none");
-    assert.equal(web.updates[0].text, "Sub-agent &lt;!channel&gt;: ✅ Completed");
-    assert.equal(web.updates[0].parse, "none");
-  });
-
-  it("does not let progress-only delivery suppress the final ok update", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Gather context",
-        status: "running",
-        publicProgressSummary: "Still gathering",
-      },
-    });
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    await handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      { childRunId: "run-1234567890", expectsCompletionMessage: true },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    harness.currentTask = {
-      id: "task-1234567890",
-      runId: "run-1234567890",
-      title: "Gather context",
-      status: "succeeded",
-      publicTerminalSummary: "Final answer is ready",
-    };
-
-    await handleEnded(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", outcome: "ok" },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.updates.length, 2);
-    assert.equal(getTask(harness.web.updates[0]).status, "complete");
-    assert.equal(getTask(harness.web.updates[0]).details.elements[0].elements[0].text, "Still gathering");
-    assert.equal(getTask(harness.web.updates[1]).status, "complete");
-    assert.equal(getTask(harness.web.updates[1]).details.elements[0].elements[0].text, "Final answer is ready");
-  });
-
-  it("appends compact tool-call tasks for tracked regular subagent runs", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Gather context",
-        status: "running",
-      },
-    });
-    enableToolTasks(harness);
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
-      {},
-    );
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", toolName: "rg", toolCallId: "call-rg-1" },
-      {},
-    );
-
-    const tasks = getTasks(harness.web.updates.at(-1));
-    assert.equal(tasks.length, 3);
-    assert.equal(tasks[0].title, "Gather context");
-    assert.deepEqual(
-      tasks.slice(1).map((task) => ({ title: task.title, status: task.status })),
-      [
-        { title: "read", status: "complete" },
-        { title: "rg", status: "complete" },
-      ],
-    );
-  });
-
-  it("does not render tool-call task cards by default", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Default hidden tools",
-        status: "running",
-      },
-    });
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      {
-        runId: "run-1234567890",
-        toolName: "exec",
-        toolCallId: "call-exec-1",
-        params: { cmd: "ssh theo openclaw plugins install @unblocklabs/slack-subagent-card" },
-        durationMs: 5200,
-        error: "failed",
-      },
-      {},
-    );
-
-    assert.equal(harness.web.updates.length, 0);
-    assert.equal(getTasks(harness.web.posts[0]).length, 1);
-    assert.equal(getTasks(harness.web.posts[0])[0].title, "Default hidden tools");
-  });
-
-  it("does not render tool-call task cards when host Slack tool progress preview is disabled", async () => {
-    const harness = makeHarness({
-      config: {
-        channels: { slack: { streaming: { preview: { toolProgress: false } } } },
-      },
-      pluginConfig: { toolTasks: { enabled: true } },
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Host disabled tools",
-        status: "running",
-      },
-    });
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
-      {},
-    );
-
-    assert.equal(harness.web.updates.length, 0);
-    assert.equal(getTasks(harness.web.posts[0]).length, 1);
-  });
-
-  it("does not treat root OpenClaw config as plugin-local tool task opt-in", async () => {
-    const harness = makeHarness({
-      config: { toolTasks: { enabled: true } },
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Root config only",
-        status: "running",
-      },
-    });
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
-      {},
-    );
-
-    assert.equal(harness.web.updates.length, 0);
-    assert.equal(getTasks(harness.web.posts[0]).length, 1);
-  });
-
-  it("marks tool-call tasks as error when after_tool_call reports an error", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Run command",
-        status: "running",
-      },
-    });
-    enableToolTasks(harness);
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      {
-        runId: "run-1234567890",
-        toolName: "exec",
-        toolCallId: "call-exec-1",
-        params: { cmd: "npm test /Users/bek/Desktop/openclaw-plugins/slack-subagent-card", cwd: "/repo" },
-        durationMs: 5200,
-        error: "failed",
-      },
-      {},
-    );
-
-    const tasks = getTasks(harness.web.updates.at(-1));
-    assert.equal(tasks[1].title, "exec npm test ~ (5s)");
-    assert.equal(tasks[1].status, "error");
-    assert.equal(tasks[1].details, undefined);
-    assert.equal(tasks[1].output, undefined);
-  });
-
-  it("ignores after_tool_call events without a tracked non-Codex run", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Ignored tools",
-        status: "running",
-      },
-    });
-
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-missing", toolName: "read", toolCallId: "call-read-1" },
-      {},
-    );
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { toolName: "read", toolCallId: "call-read-2" },
-      {},
-    );
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "codex-thread:child", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "codex-thread:child", toolName: "exec", toolCallId: "call-exec-1" },
-      {},
-    );
-
-    assert.equal(harness.web.updates.length, 0);
-    assert.equal(getTasks(harness.web.posts[0]).length, 1);
-  });
-
-  it("preserves tool-call tasks across terminal updates", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Preserve tools",
-        status: "running",
-      },
-    });
-    enableToolTasks(harness);
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await handleAfterToolCall(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", toolName: "read", toolCallId: "call-read-1" },
-      {},
-    );
-
-    harness.currentTask = {
-      id: "task-1234567890",
-      runId: "run-1234567890",
-      title: "Preserve tools",
-      status: "succeeded",
-      publicTerminalSummary: "Done",
-    };
-    await handleEnded(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", outcome: "ok" },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    const tasks = getTasks(harness.web.updates.at(-1));
-    assert.equal(tasks[0].title, "read");
-    assert.equal(tasks[0].status, "complete");
-    assert.equal(tasks[1].status, "complete");
-    assert.equal(tasks[1].title, "Preserve tools (just now)");
-  });
-
-  it("caps rendered tool-call tasks to the latest ten", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Many tools",
-        status: "running",
-      },
-    });
-    enableToolTasks(harness);
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    for (let index = 1; index <= 12; index += 1) {
-      await handleAfterToolCall(
-        harness.api,
-        harness.shared,
-        { runId: "run-1234567890", toolName: `tool_${index}`, toolCallId: `call-${index}` },
-        {},
-      );
-    }
-
-    const tasks = getTasks(harness.web.updates.at(-1));
-    assert.equal(tasks.length, 11);
-    assert.equal(tasks[1].title, "tool_3");
-    assert.equal(tasks.at(-1).title, "tool_12");
-  });
-
-  it("keeps fallback tool task ids unique after capped calls without toolCallId", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Fallback ids",
-        status: "running",
-      },
-    });
-    enableToolTasks(harness);
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    for (let index = 1; index <= 12; index += 1) {
-      await handleAfterToolCall(
-        harness.api,
-        harness.shared,
-        { runId: "run-1234567890", toolName: "exec" },
-        {},
-      );
-    }
-
-    const tasks = getTasks(harness.web.updates.at(-1));
-    assert.equal(tasks.length, 11);
-    assert.deepEqual(
-      tasks.slice(1).map((task) => task.task_id),
-      [
-        "tool-exec-3",
-        "tool-exec-4",
-        "tool-exec-5",
-        "tool-exec-6",
-        "tool-exec-7",
-        "tool-exec-8",
-        "tool-exec-9",
-        "tool-exec-10",
-        "tool-exec-11",
-        "tool-exec-12",
-      ],
-    );
-  });
-
-  it("normalizes legacy tracked runs before recording tool-call tasks", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Legacy run",
-        status: "running",
-      },
-    });
-    enableToolTasks(harness);
-    const handlers = new Map();
-    harness.api.on = (hookName, handler) => {
-      handlers.set(hookName, handler);
-    };
-    const legacyShared = {
-      runs: new Map([
-        [
-          "run-legacy",
-          {
-            messageTs: "1700000000.000200",
-            channelId: "C123",
-            threadTs: "1700000000.000100",
-            startedAt: Date.now(),
-            label: "Legacy run",
-            requesterSessionKey: THREAD_SESSION_KEY,
-          },
-        ],
-      ]),
-      registeredApis: new WeakSet(),
-      webClients: new Map(),
-      stateVersion: 1,
-    };
-    globalThis.__slackSubagentCardSharedState = legacyShared;
-
-    try {
-      registerSlackSubagentCardHandlers(harness.api);
-      await handlers.get("after_tool_call")(
-        { runId: "run-legacy", toolName: "read" },
-        {},
-      );
-
-      const tasks = getTasks(harness.web.updates.at(-1));
-      assert.equal(tasks[1].title, "read");
-      assert.equal(tasks[1].task_id, "tool-read-1");
-    } finally {
-      delete globalThis.__slackSubagentCardSharedState;
-    }
-  });
-
-  it("backfills a completed card when delivery target arrives without spawned tracking", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Investigate delivery",
-        status: "succeeded",
-        publicTerminalSummary: "Delivered through announce",
-      },
-    });
-
-    await handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      {
-        childRunId: "run-1234567890",
-        childSessionKey: "agent:test:acp:child",
-        expectsCompletionMessage: true,
-        requesterSessionKey: "agent:test:main",
-        requesterOrigin: {
-          channel: "slack",
-          to: "channel:C123",
-          threadId: "1700000000.000100",
-        },
-        spawnMode: "run",
-      },
-      { requesterSessionKey: "agent:test:main" },
-    );
-
-    assert.equal(harness.web.posts.length, 1);
-    assert.equal(harness.web.posts[0].channel, "C123");
-    assert.equal(harness.web.posts[0].thread_ts, "1700000000.000100");
-    assert.equal(harness.web.posts[0].text, "Sub-agent Investigate delivery: ✅ Completed");
-    assert.equal(getTask(harness.web.posts[0]).status, "complete");
-    assert.equal(
-      getTask(harness.web.posts[0]).details.elements[0].elements[0].text,
-      "Delivered through announce",
-    );
-  });
-
-  it("cleans up an untracked delivery reservation when backfill posting fails", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Post failure",
-        status: "succeeded",
-        publicTerminalSummary: "Delivered through announce",
-      },
-    });
-    harness.web.onPost = async () => {
-      throw new Error("slack unavailable");
-    };
-
-    await assert.rejects(
-      () =>
-        handleDeliveryTarget(
-          harness.api,
-          harness.shared,
-          {
-            childRunId: "run-1234567890",
-            expectsCompletionMessage: true,
-            requesterSessionKey: "agent:test:main",
-            requesterOrigin: {
-              channel: "slack",
-              to: "channel:C123",
-              threadId: "1700000000.000100",
-            },
-          },
-          { requesterSessionKey: "agent:test:main" },
-        ),
-      /slack unavailable/,
-    );
-
-    assert.equal(harness.shared.runs.has("run-1234567890"), false);
-  });
-
-  it("allows delivery update queued before terminal ok to complete", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Race",
-        status: "running",
-        publicProgressSummary: "Queued delivery",
-      },
-    });
-    const deliveryUpdate = deferred();
-    harness.web.onUpdate = (payload) => {
-      if (harness.web.updates.length === 1) return deliveryUpdate.promise;
-      return Promise.resolve({ ok: true, payload });
-    };
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    const delivery = handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      { childRunId: "run-1234567890", expectsCompletionMessage: true },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await waitFor(() => harness.web.updates.length === 1);
-
-    harness.currentTask = {
-      id: "task-1234567890",
-      runId: "run-1234567890",
-      title: "Race",
-      status: "succeeded",
-      publicTerminalSummary: "Final ok",
-    };
-    const ended = handleEnded(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", outcome: "ok" },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    deliveryUpdate.resolve({ ok: true });
-    await Promise.all([delivery, ended]);
-
-    assert.equal(harness.web.updates.length, 2);
-    assert.equal(getTask(harness.web.updates[0]).details.elements[0].elements[0].text, "Queued delivery");
-    assert.equal(getTask(harness.web.updates[1]).details.elements[0].elements[0].text, "Final ok");
-  });
-
-  it("normalizes legacy shared state left by older plugin versions", async () => {
-    try {
-      const harness = makeHarness({
-        task: {
-          id: "task-1234567890",
-          runId: "run-1234567890",
-          title: "Legacy state",
-          status: "running",
-        },
-      });
-      const legacyRegisteredApis = new WeakSet();
-      legacyRegisteredApis.add(harness.api);
-      globalThis.__slackSubagentCardSharedState = {
-        runs: new Map(),
-        registeredApis: legacyRegisteredApis,
-        pluginBotId: "B123",
-      };
-      harness.api.registrationMode = "full";
-      harness.api.createSlackWebClient = () => harness.web;
-      const handlers = new Map();
-      harness.api.on = (hookName, handler) => {
-        handlers.set(hookName, handler);
-      };
-
-      registerSlackSubagentCardHandlers(harness.api);
-      await handlers.get("subagent_spawned")(
-        { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-        { requesterSessionKey: THREAD_SESSION_KEY },
-      );
-
-      assert.ok(globalThis.__slackSubagentCardSharedState.webClients instanceof Map);
-      assert.equal(harness.web.posts.length, 1);
-    } finally {
-      delete globalThis.__slackSubagentCardSharedState;
-    }
-  });
-
-  it("registers typed hooks whenever the host exposes api.on", () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Discovery registration",
-        status: "running",
-      },
-    });
-    const handlers = new Map();
-    harness.api.registrationMode = "discovery";
-    harness.api.on = (hookName, handler) => {
-      handlers.set(hookName, handler);
-    };
-
-    registerSlackSubagentCardHandlers(harness.api);
-
-    assert.deepEqual([...handlers.keys()], [
-      "subagent_spawned",
-      "subagent_ended",
-      "subagent_delivery_target",
-      "after_tool_call",
-    ]);
-  });
-
-  it("does not log or process after_tool_call events by default through the registered hook", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Default registered hook",
-        status: "running",
-      },
-    });
-    const handlers = new Map();
-    const infoMessages = [];
-    harness.api.logger.info = (message) => {
-      infoMessages.push(message);
-    };
-    harness.api.on = (hookName, handler) => {
-      handlers.set(hookName, handler);
-    };
-
-    registerSlackSubagentCardHandlers(harness.api);
-    await handlers.get("after_tool_call")(
-      {
-        runId: "run-1234567890",
-        toolName: "exec",
-        toolCallId: "call-exec-1",
-        params: { cmd: "ssh theo openclaw plugins install @unblocklabs/slack-subagent-card" },
-        error: "failed",
-      },
-      {},
-    );
-
-    assert.equal(harness.web.updates.length, 0);
-    assert.equal(infoMessages.some((message) => message.includes("after_tool_call fired")), false);
-  });
-
-  it("skips registration when the host does not expose typed hooks", () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Setup only",
-        status: "running",
-      },
-    });
-    delete harness.api.on;
-    harness.api.registrationMode = "setup-only";
-
-    assert.doesNotThrow(() => registerSlackSubagentCardHandlers(harness.api));
-  });
-
-  it("posts when Slack thread id is numeric", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Numeric thread",
-        status: "running",
-      },
-    });
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: 1700000000.0001 } },
-      { requesterSessionKey: "agent:test:main" },
-    );
-
-    assert.equal(harness.web.posts.length, 1);
-    assert.equal(harness.web.posts[0].thread_ts, "1700000000.0001");
-  });
-
-  it("does not backfill a duplicate card while spawn posting is in flight", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Race",
-        status: "succeeded",
-        publicTerminalSummary: "Done",
-      },
-    });
-    const spawnPost = deferred();
-    harness.web.onPost = (payload) => {
-      if (harness.web.posts.length === 1) return spawnPost.promise;
-      return Promise.resolve({ ts: "1700000000.000300", payload });
-    };
-
-    const spawned = handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await waitFor(() => harness.web.posts.length === 1);
-
-    const delivery = handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      {
-        childRunId: "run-1234567890",
-        expectsCompletionMessage: true,
-        requesterSessionKey: THREAD_SESSION_KEY,
-        requesterOrigin: { channel: "slack", to: "channel:C123", threadId: "1700000000.000100" },
-      },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    await assertRemainsPending(delivery);
-    assert.equal(harness.web.posts.length, 1);
-    spawnPost.resolve({ ts: "1700000000.000200" });
-    await Promise.all([spawned, delivery]);
-
-    assert.equal(harness.web.posts.length, 1);
-    assert.equal(harness.web.updates.length, 1);
-    assert.equal(getTask(harness.web.updates[0]).status, "complete");
-  });
-
-  it("treats an empty secret resolver result as unresolved instead of throwing", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Investigate",
-        status: "running",
-      },
-    });
-    harness.api.config = { channels: { slack: { botToken: undefined } } };
-    harness.api.resolveConfiguredSecretInputWithFallback = async () => ({ secretRefConfigured: false });
-    delete process.env.SLACK_BOT_TOKEN;
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.posts.length, 0);
-  });
-
-  it("uses a plaintext configured Slack bot token even if the resolver returns empty", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Configured token",
-        status: "running",
-      },
-    });
-    harness.api.config = { channels: { slack: { botToken: TOKEN } } };
-    harness.api.resolveConfiguredSecretInputWithFallback = async () => ({ secretRefConfigured: false });
-    delete process.env.SLACK_BOT_TOKEN;
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.posts.length, 1);
-  });
-
-  it("uses the fallback Slack client factory when the host client factory is missing", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Fallback client",
-        status: "running",
-      },
-    });
-    harness.shared.webClients.clear();
-    harness.api.createSlackWebClient = undefined;
-    harness.api.fallbackSlackWebClientFactory = () => harness.web;
-    harness.api.config = { channels: { slack: { botToken: TOKEN } } };
-    delete process.env.SLACK_BOT_TOKEN;
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    assert.equal(harness.web.posts.length, 1);
-  });
-
-  it("serializes delivery and terminal updates so terminal outcome wins", async () => {
-    const harness = makeHarness({
-      task: {
-        id: "task-1234567890",
-        runId: "run-1234567890",
-        title: "Investigate",
-        status: "succeeded",
-        publicTerminalSummary: "Delivery summary",
-      },
-    });
-    const firstUpdate = deferred();
-    harness.web.onUpdate = (payload) => {
-      if (harness.web.updates.length === 1) return firstUpdate.promise;
-      return Promise.resolve({ ok: true, payload });
-    };
-
-    await handleSpawned(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", requester: { to: "C123", threadId: "1700000000.000100" } },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    const delivery = handleDeliveryTarget(
-      harness.api,
-      harness.shared,
-      { childRunId: "run-1234567890", expectsCompletionMessage: true },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-    await waitFor(() => harness.web.updates.length === 1);
-
-    harness.currentTask = {
-      id: "task-1234567890",
-      runId: "run-1234567890",
-      title: "Investigate",
-      status: "failed",
-      publicError: "Boom",
-    };
-    const ended = handleEnded(
-      harness.api,
-      harness.shared,
-      { runId: "run-1234567890", outcome: "error", error: "Boom" },
-      { requesterSessionKey: THREAD_SESSION_KEY },
-    );
-
-    firstUpdate.resolve({ ok: true });
-    await Promise.all([delivery, ended]);
-
-    assert.equal(harness.web.updates.length, 2);
-    assert.equal(getTask(harness.web.updates[0]).status, "complete");
-    assert.equal(getTask(harness.web.updates[1]).status, "error");
-    assert.equal(getTask(harness.web.updates[1]).details.elements[0].elements[0].text, "Boom");
-  });
-});
-
-function makeHarness({ config, pluginConfig, task, stream = false }) {
-  const web = makeFakeWeb({ stream });
-  const shared = createSharedState();
-  shared.webClients.set(TOKEN, web);
-
-  const bindSessionKeys = [];
-  const harness = {
-    bindSessionKeys,
-    currentTask: task,
-    shared,
-    web,
+function createTaskRunDetail(overrides = {}) {
+  const runId = overrides.runId ?? "run-1234567890";
+  const createdAt = overrides.createdAt ?? 1_700_000_000_000;
+  return {
+    id: `task-${runId}`,
+    runtime: "subagent",
+    sessionKey: THREAD_SESSION_KEY,
+    ownerKey: THREAD_SESSION_KEY,
+    scope: "session",
+    childSessionKey: CHILD_SESSION_KEY,
+    agentId: "research-agent",
+    runId,
+    title: "Gather context",
+    status: "running",
+    deliveryStatus: "pending",
+    notifyPolicy: "done_only",
+    createdAt,
+    startedAt: createdAt + 10,
+    lastEventAt: createdAt + 20,
+    ...overrides,
   };
+}
 
-  harness.api = {
-    logger: {
-      info() {},
-      warn() {},
-      debug() {},
-    },
-    config,
-    pluginConfig,
-    fallbackSlackWebClientFactory() {
-      return web;
-    },
-    runtime: {
-      tasks: {
-        runs: {
-          bindSession({ sessionKey }) {
-            bindSessionKeys.push(sessionKey);
-            return {
-              resolve() {
-                return harness.currentTask;
-              },
-            };
-          },
-        },
-      },
-    },
-    on() {},
+function createRequester(overrides = {}) {
+  return {
+    channel: "slack",
+    to: "channel:C123",
+    threadId: "1700000000.000100",
+    channelId: "C123",
+    messageId: "1700000000.000100",
+    ...overrides,
   };
-
-  process.env.SLACK_BOT_TOKEN = TOKEN;
-  process.env.OPENCLAW_SLACK_SUBAGENT_CARD_DISABLE_LOCAL_CONFIG_FALLBACK = "1";
-  return harness;
 }
 
-function makeStreamHarness(task = {}, { config } = {}) {
-  return makeHarness({
-    config,
-    stream: true,
-    task: {
-      id: "task-1234567890",
-      runId: "run-1234567890",
-      title: "Gather context",
-      status: "running",
-      ...task,
-    },
-  });
-}
-
-function enableToolTasks(harness) {
-  harness.api.pluginConfig = {
-    ...(harness.api.pluginConfig ?? {}),
-    toolTasks: { enabled: true },
+function createHookContext(runId, overrides = {}) {
+  return {
+    runId,
+    childSessionKey: CHILD_SESSION_KEY,
+    requesterSessionKey: THREAD_SESSION_KEY,
+    ...overrides,
   };
-  return harness;
 }
 
-async function spawnStreamedRun({
-  harness,
-  event,
-  context = {},
-  task,
-  toolTasks = false,
-} = {}) {
-  const activeHarness = harness ?? makeStreamHarness(task);
-  if (toolTasks) enableToolTasks(activeHarness);
-  await handleSpawned(
-    activeHarness.api,
-    activeHarness.shared,
-    {
-      runId: "run-1234567890",
-      ...(event ?? { requester: STREAM_REQUESTER }),
-    },
-    {
-      requesterSessionKey: THREAD_SESSION_KEY,
-      ...context,
-    },
-  );
-  return activeHarness;
-}
-
-function makeFakeWeb({ stream = false } = {}) {
-  const web = {
-    appends: [],
-    opens: [],
-    posts: [],
-    starts: [],
-    stops: [],
-    updates: [],
-    onAppend: undefined,
-    onPost: undefined,
-    onStart: undefined,
-    onStop: undefined,
-    onUpdate: undefined,
-    chat: {
-      async postMessage(payload) {
-        web.posts.push(payload);
-        if (web.onPost) return web.onPost(payload);
-        return { ts: "1700000000.000200" };
-      },
-      async update(payload) {
-        web.updates.push(payload);
-        if (web.onUpdate) return web.onUpdate(payload);
-        return { ok: true };
-      },
-    },
-    conversations: {
-      async open(payload) {
-        web.opens.push(payload);
-        return { ok: true, channel: { id: `D${String(payload.users).replace(/^U/, "")}` } };
-      },
-    },
+function createSpawnedEvent(runId, overrides = {}) {
+  return {
+    runId,
+    childSessionKey: CHILD_SESSION_KEY,
+    agentId: "research-agent",
+    label: "Gather context",
+    mode: "run",
+    requester: createRequester(),
+    threadRequested: true,
+    ...overrides,
   };
-  if (stream) {
-    web.chat.startStream = async (payload) => {
-      web.starts.push(payload);
-      if (web.onStart) return web.onStart(payload);
-      return { ok: true, ts: "1700000000.000200" };
-    };
-    web.chat.appendStream = async (payload) => {
-      web.appends.push(payload);
-      if (web.onAppend) return web.onAppend(payload);
-      return { ok: true };
-    };
-    web.chat.stopStream = async (payload) => {
-      web.stops.push(payload);
-      if (web.onStop) return web.onStop(payload);
-      return { ok: true };
-    };
-  }
-  return web;
 }
 
-function getTask(payload) {
-  return payload.blocks[0].tasks[0];
+function createProgressEvent(phase, runId, overrides = {}) {
+  return {
+    phase,
+    runId,
+    childSessionKey: CHILD_SESSION_KEY,
+    requester: createRequester(),
+    ...(phase === "ended" ? { outcome: "ok" } : {}),
+    ...overrides,
+  };
 }
 
-function getTasks(payload) {
-  return payload.blocks[0].tasks;
+function createEndedEvent(runId, overrides = {}) {
+  return {
+    targetSessionKey: CHILD_SESSION_KEY,
+    targetKind: "subagent",
+    reason: "subagent-complete",
+    runId,
+    endedAt: 1_700_000_010_000,
+    outcome: "ok",
+    ...overrides,
+  };
 }
 
 function deferred() {
@@ -1524,23 +108,689 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function waitFor(predicate) {
-  const deadline = Date.now() + 1000;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
+async function waitFor(predicate, message = "condition", timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${message}`);
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  assert.fail("condition was not met before timeout");
 }
 
-async function assertRemainsPending(promise) {
-  const marker = Symbol("pending");
-  const result = await Promise.race([
-    promise.then(
-      () => "resolved",
-      () => "rejected",
-    ),
-    Promise.resolve(marker),
-  ]);
-  assert.equal(result, marker);
+async function withEnv(changes, work) {
+  const previous = new Map();
+  for (const [key, value] of Object.entries(changes)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    return await work();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
+
+function createFakeWeb(options = {}) {
+  const posts = [];
+  const updates = [];
+  const opens = [];
+  let streamCalls = 0;
+  const web = {
+    posts,
+    updates,
+    opens,
+    get streamCalls() {
+      return streamCalls;
+    },
+    chat: {
+      async postMessage(params) {
+        posts.push(params);
+        if (options.onPost) return options.onPost(params, posts.length);
+        return { ts: `1700000000.${String(200 + posts.length).padStart(6, "0")}` };
+      },
+      async update(params) {
+        updates.push(params);
+        if (options.onUpdate) return options.onUpdate(params, updates.length);
+        return { ok: true };
+      },
+      async startStream() {
+        streamCalls += 1;
+        throw new Error("native Slack streams must not be used");
+      },
+      async appendStream() {
+        streamCalls += 1;
+        throw new Error("native Slack streams must not be used");
+      },
+      async stopStream() {
+        streamCalls += 1;
+        throw new Error("native Slack streams must not be used");
+      },
+    },
+    conversations: {
+      async open(params) {
+        opens.push(params);
+        if (options.onOpen) return options.onOpen(params, opens.length);
+        return { channel: { id: "D123" } };
+      },
+    },
+  };
+  return web;
+}
+
+function createHarness(options = {}) {
+  const shared = options.shared ?? createSharedState();
+  const web = options.web ?? createFakeWeb();
+  const tokens = [];
+  const logs = { debug: [], info: [], warn: [] };
+  let currentTask = options.task;
+  const api = {
+    config: options.config ?? { channels: { slack: { botToken: TOKEN } } },
+    pluginConfig: options.toolTasks ? { toolTasks: { enabled: true } } : undefined,
+    logger: {
+      debug(message) { logs.debug.push(message); },
+      info(message) { logs.info.push(message); },
+      warn(message) { logs.warn.push(message); },
+    },
+    createSlackWebClient(token) {
+      tokens.push(token);
+      return options.clientForToken?.(token) ?? web;
+    },
+    runtime: {
+      tasks: {
+        runs: {
+          bindSession({ sessionKey }) {
+            assert.equal(sessionKey, options.sessionKey ?? THREAD_SESSION_KEY);
+            return { resolve: () => currentTask };
+          },
+        },
+      },
+    },
+  };
+  return {
+    api,
+    shared,
+    web,
+    tokens,
+    logs,
+    setTask(task) { currentTask = task; },
+  };
+}
+
+async function spawn(harness, options = {}) {
+  const runId = options.runId ?? "run-1234567890";
+  const requesterSessionKey = options.sessionKey ?? THREAD_SESSION_KEY;
+  const requester = options.requester
+    ? createRequester(options.requester)
+    : createRequester();
+  await handleSpawned(
+    harness.api,
+    harness.shared,
+    createSpawnedEvent(runId, {
+      label: options.label ?? "Gather context",
+      requester,
+    }),
+    createHookContext(runId, { requesterSessionKey }),
+  );
+  return runId;
+}
+
+function plan(payload) {
+  return payload.blocks[0];
+}
+
+function mainTask(payload) {
+  const tasks = plan(payload).tasks;
+  return tasks.find((task) => !String(task.task_id).startsWith("tool-"));
+}
+
+function richTextValue(value) {
+  return value?.elements?.flatMap((section) => section.elements ?? []).map((item) => item.text ?? "").join("") ?? "";
+}
+
+describe("portable lifecycle convergence", () => {
+  it("posts a Block Kit card and never invokes Slack native stream methods", async () => {
+    const harness = createHarness();
+    await spawn(harness);
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(harness.web.streamCalls, 0);
+    assert.equal(plan(harness.web.posts[0]).type, "plan");
+    assert.equal(mainTask(harness.web.posts[0]).status, "in_progress");
+    assert.equal(harness.shared.runs.size, 1);
+  });
+
+  it("finalizes a retained run from subagent_progress ended", async () => {
+    const harness = createHarness();
+    const runId = await spawn(harness);
+    harness.setTask(createTaskRunDetail({
+      id: "task-123",
+      runId,
+      status: "succeeded",
+      deliveryStatus: "delivered",
+      endedAt: 1_700_000_010_000,
+      terminalOutcome: "succeeded",
+    }));
+
+    await handleProgress(
+      harness.api,
+      harness.shared,
+      createProgressEvent("ended", runId),
+      createHookContext(runId),
+    );
+
+    assert.equal(harness.web.updates.length, 1);
+    assert.equal(mainTask(harness.web.updates[0]).status, "complete");
+    assert.equal(harness.shared.runs.has(runId), false);
+  });
+
+  it("coalesces portable progress and compatibility ended signals in either order", async () => {
+    for (const order of ["progress-first", "ended-first"]) {
+      const harness = createHarness();
+      const runId = await spawn(harness, { runId: `run-${order}` });
+      const progress = () => handleProgress(
+        harness.api,
+        harness.shared,
+        createProgressEvent("ended", runId),
+        createHookContext(runId),
+      );
+      const ended = () => handleEnded(
+        harness.api,
+        harness.shared,
+        createEndedEvent(runId),
+        createHookContext(runId),
+      );
+
+      if (order === "progress-first") await Promise.all([progress(), ended()]);
+      else await Promise.all([ended(), progress()]);
+
+      assert.equal(harness.web.updates.length, 1, order);
+      assert.equal(harness.shared.runs.has(runId), false, order);
+    }
+  });
+
+  it("maps the official unknown portable outcome to failure instead of success", async () => {
+    const harness = createHarness();
+    const runId = await spawn(harness, { runId: "run-unknown" });
+    await handleProgress(
+      harness.api,
+      harness.shared,
+      createProgressEvent("ended", runId, { outcome: "unknown" }),
+      createHookContext(runId),
+    );
+    assert.equal(mainTask(harness.web.updates[0]).status, "error");
+    assert.match(richTextValue(mainTask(harness.web.updates[0]).details), /failed/i);
+  });
+
+  it("robustness: treats a malformed ended progress event with no outcome as failure", async () => {
+    const harness = createHarness();
+    const runId = await spawn(harness, { runId: "run-missing-outcome" });
+    await handleProgress(
+      harness.api,
+      harness.shared,
+      { phase: "ended", runId, childSessionKey: CHILD_SESSION_KEY, requester: createRequester() },
+      createHookContext(runId),
+    );
+    assert.equal(mainTask(harness.web.updates[0]).status, "error");
+    assert.match(richTextValue(mainTask(harness.web.updates[0]).details), /failed/i);
+  });
+
+  it("never renders raw task summaries or compatibility-hook error details", async () => {
+    const harness = createHarness();
+    const runId = await spawn(harness);
+    const secrets = [
+      "raw progress from a private workspace",
+      "raw terminal copied user content",
+      "raw task error xoxb-private-token",
+      "compatibility hook error with private details",
+      "compatibility hook reason with private details",
+    ];
+    harness.setTask(createTaskRunDetail({
+      id: "task-private",
+      runId,
+      title: "Private task",
+      status: "failed",
+      deliveryStatus: "failed",
+      endedAt: 1_700_000_010_000,
+      progressSummary: secrets[0],
+      terminalSummary: secrets[1],
+      error: secrets[2],
+    }));
+
+    await handleEnded(
+      harness.api,
+      harness.shared,
+      createEndedEvent(runId, { outcome: "error", error: secrets[3], reason: secrets[4] }),
+      createHookContext(runId),
+    );
+
+    const rendered = JSON.stringify(harness.web.updates[0]);
+    assert.equal(mainTask(harness.web.updates[0]).status, "error");
+    assert.match(richTextValue(mainTask(harness.web.updates[0]).details), /failed/i);
+    for (const secret of secrets) assert.equal(rendered.includes(secret), false);
+  });
+
+  it("merges richer spawned metadata into portable started without a duplicate post", async () => {
+    const harness = createHarness();
+    const runId = "run-portable-start";
+    await handleProgress(
+      harness.api,
+      harness.shared,
+      createProgressEvent("started", runId, { childSessionKey: "agent:test:subagent:portable" }),
+      createHookContext(runId, { childSessionKey: "agent:test:subagent:portable" }),
+    );
+    await handleSpawned(
+      harness.api,
+      harness.shared,
+      createSpawnedEvent(runId, {
+        childSessionKey: "agent:test:subagent:portable",
+        agentId: "research-agent",
+        label: "Research worker",
+        mode: "session",
+      }),
+      createHookContext(runId, { childSessionKey: "agent:test:subagent:portable" }),
+    );
+
+    assert.equal(harness.web.posts.length, 1);
+    assert.equal(harness.web.updates.length, 1);
+    assert.equal(mainTask(harness.web.updates[0]).title, "Research worker");
+    assert.match(richTextValue(mainTask(harness.web.updates[0]).details), /persistent background worker session/i);
+    assert.match(richTextValue(mainTask(harness.web.updates[0]).output), /worker session continues/i);
+    assert.equal(harness.shared.runs.get(runId).mode, "session");
+    assert.equal(harness.shared.runs.get(runId).agentId, "research-agent");
+    assert.equal(harness.shared.runs.get(runId).childSessionKey, "agent:test:subagent:portable");
+    assert.equal(harness.shared.runs.has(runId), true);
+  });
+
+  it("registers the portable and compatibility lifecycle hooks", () => {
+    const registrations = [];
+    const harness = createHarness();
+    harness.api.on = (name, handler) => registrations.push({ name, handler });
+
+    registerSlackSubagentCardHandlers(harness.api, harness.shared);
+
+    assert.deepEqual(
+      registrations.map(({ name }) => name),
+      ["subagent_spawned", "subagent_progress", "subagent_ended", "after_tool_call"],
+    );
+  });
+
+  it("reserves synchronously and returns from the hook while Slack is blocked", async () => {
+    const gate = deferred();
+    const web = createFakeWeb({ onPost: () => gate.promise });
+    const harness = createHarness({ web });
+    const registrations = new Map();
+    harness.api.on = (name, handler) => registrations.set(name, handler);
+    registerSlackSubagentCardHandlers(harness.api, harness.shared);
+
+    const result = registrations.get("subagent_spawned")(
+      createSpawnedEvent("run-blocked", { label: "Blocked post" }),
+      createHookContext("run-blocked"),
+    );
+
+    assert.equal(result, undefined);
+    assert.equal(harness.shared.runs.has("run-blocked"), true);
+    await waitFor(() => web.posts.length === 1, "initial Slack post");
+    gate.resolve({ ts: "1700000000.000200" });
+    await waitFor(() => harness.shared.runs.get("run-blocked")?.messageTs, "completed initialization");
+  });
+
+  it("preserves a terminal signal that arrives during initialization", async () => {
+    const gate = deferred();
+    const web = createFakeWeb({ onPost: () => gate.promise });
+    const harness = createHarness({ web });
+    const registrations = new Map();
+    harness.api.on = (name, handler) => registrations.set(name, handler);
+    registerSlackSubagentCardHandlers(harness.api, harness.shared);
+
+    registrations.get("subagent_spawned")(
+      createSpawnedEvent("run-race", { label: "Race" }),
+      createHookContext("run-race"),
+    );
+    registrations.get("subagent_progress")(
+      createProgressEvent("ended", "run-race"),
+      createHookContext("run-race"),
+    );
+    gate.resolve({ ts: "1700000000.000200" });
+
+    await waitFor(() => web.updates.length === 1 && !harness.shared.runs.has("run-race"), "terminal update");
+    assert.equal(web.updates.length, 1);
+  });
+
+  it("cleans up when secret resolution rejects after the terminal claim", async () => {
+    const harness = createHarness({
+      config: { channels: { slack: { botToken: "${SLACK_CARD_TOKEN}" } } },
+    });
+    let resolutions = 0;
+    harness.api.resolveConfiguredSecretInputWithFallback = async () => {
+      resolutions += 1;
+      if (resolutions === 1) return { value: TOKEN, source: "secretRef" };
+      throw new Error("secret backend unavailable");
+    };
+    const runId = await spawn(harness);
+
+    await handleEnded(
+      harness.api,
+      harness.shared,
+      createEndedEvent(runId),
+      createHookContext(runId),
+    );
+
+    assert.equal(resolutions, 2);
+    assert.equal(harness.shared.runs.has(runId), false);
+    assert.equal(harness.web.updates.length, 0);
+    assert.ok(harness.logs.warn.some((message) => message.includes("secret backend unavailable")));
+  });
+});
+
+describe("tool updates and presentation safety", () => {
+  it("serializes concurrent tool mutations and renders exact snapshots", async () => {
+    const firstUpdate = deferred();
+    const web = createFakeWeb({
+      onUpdate(_params, number) {
+        return number === 1 ? firstUpdate.promise : { ok: true };
+      },
+    });
+    const harness = createHarness({ web, toolTasks: true });
+    const runId = await spawn(harness);
+
+    const a = handleAfterToolCall(harness.api, harness.shared, {
+      runId, toolName: "exec", failed: false,
+    });
+    await waitFor(() => web.updates.length === 1, "first tool update");
+    const b = handleAfterToolCall(harness.api, harness.shared, {
+      runId, toolName: "read", failed: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(web.updates.length, 1);
+
+    firstUpdate.resolve({ ok: true });
+    await Promise.all([a, b]);
+
+    assert.deepEqual(plan(web.updates[0]).tasks.map((task) => task.task_id), [runId, "tool-1"]);
+    assert.deepEqual(plan(web.updates[1]).tasks.map((task) => task.task_id), [runId, "tool-1", "tool-2"]);
+  });
+
+  it("robustness: direct handler ignores unexpected tool arguments and external call IDs", async () => {
+    const harness = createHarness({ toolTasks: true });
+    const runId = await spawn(harness);
+    const secrets = [
+      "xoxb-super-secret",
+      "Bearer top-secret",
+      "https://user:pass@example.test/path",
+      "sk-live-secret",
+      "AWS_SECRET_ACCESS_KEY=aws-secret",
+      "postgres://admin:db-password@db.example.test/app",
+      "-----BEGIN PRIVATE KEY-----private-material",
+    ];
+    const hostileEvents = [
+      {
+        toolName: "exec",
+        toolCallId: `call-${secrets[0]}`,
+        params: {
+          cmd: `curl -H 'Authorization: ${secrets[1]}' ${secrets[2]} --token ${secrets[0]}`,
+          env: { SECRET: secrets[4] },
+        },
+      },
+      {
+        toolName: "search",
+        toolCallId: `call-${secrets[3]}`,
+        params: { query: secrets.join(" "), headers: { authorization: secrets[1] } },
+      },
+      {
+        toolName: "read",
+        toolCallId: `call-${secrets[5]}`,
+        params: { path: `/tmp/${secrets[0]}.txt`, url: secrets[5] },
+      },
+      {
+        toolName: "custom",
+        toolCallId: `call-${secrets[6]}`,
+        params: { api_key: secrets[3], note: secrets[6], enabled: true, count: 42 },
+      },
+    ];
+
+    for (const [index, event] of hostileEvents.entries()) {
+      await handleAfterToolCall(
+        harness.api,
+        harness.shared,
+        { runId, ...event, failed: false, durationMs: index === 0 ? 5_200 : undefined },
+      );
+    }
+
+    const rendered = JSON.stringify(harness.web.updates.at(-1));
+    for (const secret of [...secrets, "top-secret", "user:pass", "db-password", "private-material"]) {
+      assert.equal(rendered.includes(secret), false, secret);
+    }
+    const toolRows = plan(harness.web.updates.at(-1)).tasks.filter((task) => String(task.task_id).startsWith("tool-"));
+    assert.deepEqual(toolRows.map((task) => task.task_id), ["tool-1", "tool-2", "tool-3", "tool-4"]);
+    assert.deepEqual(toolRows.map((task) => task.title), ["exec (5s)", "search", "read file", "custom"]);
+
+    for (let index = 0; index < 20; index += 1) {
+      await handleAfterToolCall(
+        harness.api,
+        harness.shared,
+        {
+          runId,
+          toolName: "custom",
+          failed: false,
+          toolCallId: `external-${index}-${secrets[index % secrets.length]}`,
+          params: { payload: secrets[index % secrets.length] },
+        },
+      );
+    }
+
+    const tracked = harness.shared.runs.get(runId);
+    assert.equal(Object.hasOwn(tracked, "toolTaskIdsByCallId"), false);
+    assert.equal(tracked.toolCalls.length, 10);
+    assert.equal(tracked.nextToolTaskSequence, 24);
+    const trackedState = JSON.stringify(tracked);
+    for (const secret of [...secrets, "top-secret", "user:pass", "db-password", "private-material"]) {
+      assert.equal(trackedState.includes(secret), false, `retained ${secret}`);
+    }
+  });
+
+  it("bounds and single-lines hostile tool names before logging, retaining, or rendering", async () => {
+    const harness = createHarness({ toolTasks: true });
+    const runId = await spawn(harness, { runId: "run-hostile-tool-name" });
+    const registrations = new Map();
+    harness.api.on = (name, handler) => registrations.set(name, handler);
+    registerSlackSubagentCardHandlers(harness.api, harness.shared);
+
+    const hostileToolName = `hostile-tool\nFORGED level=error ${"x".repeat(10_000)}`;
+    const unexpectedSecret = "unexpected-enumerable-private-value";
+    let unexpectedGetterReads = 0;
+    const hostEvent = {
+      toolName: hostileToolName,
+      params: { secret: unexpectedSecret },
+      result: { secret: unexpectedSecret },
+      toolCallId: unexpectedSecret,
+      error: `raw failure ${unexpectedSecret}`,
+      runId,
+      durationMs: Number.MAX_VALUE,
+    };
+    Object.defineProperty(hostEvent, "unexpectedEnumerable", {
+      enumerable: true,
+      get() {
+        unexpectedGetterReads += 1;
+        throw new Error("unexpected enumerable field was captured");
+      },
+    });
+    const result = registrations.get("after_tool_call")(
+      hostEvent,
+      { runId },
+    );
+
+    assert.equal(result, undefined);
+    await waitFor(() => harness.web.updates.length === 1, "bounded hostile tool update");
+
+    const logLine = harness.logs.info.find((message) => message.includes("after_tool_call fired"));
+    assert.ok(logLine);
+    assert.equal(unexpectedGetterReads, 0);
+    assert.equal(logLine.includes("\n"), false);
+    assert.equal(logLine.includes(unexpectedSecret), false);
+    const loggedName = /toolName=(.*) status=error$/.exec(logLine)?.[1];
+    assert.ok(loggedName);
+    assert.ok(loggedName.length <= 96);
+
+    const retained = harness.shared.runs.get(runId).toolCalls[0];
+    assert.equal(retained.name, loggedName);
+    assert.equal(retained.name.includes("\n"), false);
+    assert.ok(retained.name.length <= 96);
+    assert.equal(retained.status, "error");
+    assert.equal(retained.durationMs, 60 * 60 * 1_000);
+    assert.equal(JSON.stringify(retained).includes(hostileToolName), false);
+    assert.equal(JSON.stringify(retained).includes(unexpectedSecret), false);
+    assert.deepEqual(Object.keys(retained).sort(), ["detail", "durationMs", "id", "name", "status"]);
+
+    const toolRow = plan(harness.web.updates[0]).tasks.find((task) => task.task_id === "tool-1");
+    assert.equal(toolRow.title.includes("\n"), false);
+    assert.ok(toolRow.title.length <= 96);
+    assert.equal(toolRow.status, "error");
+    assert.equal(JSON.stringify(harness.web.updates[0]).includes(hostileToolName), false);
+    assert.equal(JSON.stringify(harness.web.updates[0]).includes(unexpectedSecret), false);
+  });
+
+  it("keeps tool rows opt-in and honors the host preview kill switch", async () => {
+    for (const options of [
+      {},
+      {
+        toolTasks: true,
+        config: { channels: { slack: { botToken: TOKEN, streaming: { preview: { toolProgress: false } } } } },
+      },
+    ]) {
+      const harness = createHarness(options);
+      const runId = await spawn(harness);
+      await handleAfterToolCall(harness.api, harness.shared, { runId, toolName: "read", failed: false });
+      assert.equal(harness.web.updates.length, 0);
+    }
+  });
+
+  it("does not retry failed Slack calls in plugin code", async () => {
+    let attempts = 0;
+    const web = createFakeWeb({
+      onPost() {
+        attempts += 1;
+        throw Object.assign(new Error("rate_limited"), { code: "slack_webapi_rate_limited_error" });
+      },
+    });
+    const harness = createHarness({ web });
+    await assert.rejects(() => spawn(harness));
+    assert.equal(attempts, 1);
+    assert.equal(harness.shared.runs.size, 0);
+  });
+
+  it("drops a reservation when Slack returns no message timestamp", async () => {
+    const harness = createHarness({ web: createFakeWeb({ onPost: () => ({ ok: true }) }) });
+    const runId = await spawn(harness);
+    assert.equal(harness.shared.runs.has(runId), false);
+  });
+});
+
+describe("Slack account and client isolation", () => {
+  it("uses configured defaultAccount when the event omits accountId", async () => {
+    const harness = createHarness({
+      config: {
+        channels: {
+          slack: {
+            defaultAccount: "work",
+            accounts: { work: { botToken: "xoxb-work" }, other: { botToken: "xoxb-other" } },
+          },
+        },
+      },
+    });
+    await spawn(harness);
+    assert.deepEqual(harness.tokens, ["xoxb-work"]);
+  });
+
+  it("does not fall through from a named account to default or env credentials", async () => {
+    await withEnv({ SLACK_BOT_TOKEN: "xoxb-env" }, async () => {
+      const harness = createHarness({
+        config: {
+          channels: {
+            slack: {
+              botToken: "xoxb-root",
+              accounts: { default: { botToken: "xoxb-default" }, work: { botToken: undefined } },
+            },
+          },
+        },
+      });
+      await spawn(harness, { requester: { accountId: "work" } });
+      assert.deepEqual(harness.tokens, []);
+      assert.equal(harness.web.posts.length, 0);
+    });
+  });
+
+  it("allows a named account to inherit the channel-level bot token", async () => {
+    const harness = createHarness({
+      config: { channels: { slack: { botToken: "xoxb-root", accounts: { work: {} } } } },
+    });
+    await spawn(harness, { requester: { accountId: "work" } });
+    assert.deepEqual(harness.tokens, ["xoxb-root"]);
+  });
+
+  it("uses SLACK_BOT_TOKEN only for the effective default account", async () => {
+    await withEnv({ SLACK_BOT_TOKEN: "xoxb-env" }, async () => {
+      const harness = createHarness({ config: {} });
+      await spawn(harness);
+      assert.deepEqual(harness.tokens, ["xoxb-env"]);
+    });
+  });
+
+  it("does not read credentials from the legacy local-config escape hatch", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "slack-card-test-"));
+    const configPath = join(directory, "openclaw.json");
+    await writeFile(configPath, JSON.stringify({ channels: { slack: { botToken: "xoxb-disk" } } }));
+    try {
+      await withEnv({
+        SLACK_BOT_TOKEN: undefined,
+        OPENCLAW_SLACK_SUBAGENT_CARD_CONFIG_PATH: configPath,
+      }, async () => {
+        const harness = createHarness({ config: {} });
+        await spawn(harness);
+        assert.deepEqual(harness.tokens, []);
+        assert.equal(harness.web.posts.length, 0);
+      });
+      assert.match(await readFile(configPath, "utf8"), /xoxb-disk/);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("scopes DM-channel caching to each Slack client", async () => {
+    const webA = createFakeWeb({ onOpen: () => ({ channel: { id: "DA" } }) });
+    const webB = createFakeWeb({ onOpen: () => ({ channel: { id: "DB" } }) });
+    const config = {
+      channels: {
+        slack: {
+          accounts: {
+            a: { botToken: "xoxb-a" },
+            b: { botToken: "xoxb-b" },
+          },
+        },
+      },
+    };
+    const harness = createHarness({
+      config,
+      sessionKey: DM_SESSION_KEY,
+      clientForToken: (token) => token === "xoxb-a" ? webA : webB,
+    });
+
+    await spawn(harness, { runId: "run-a1", sessionKey: DM_SESSION_KEY, requester: { accountId: "a" } });
+    await spawn(harness, { runId: "run-a2", sessionKey: DM_SESSION_KEY, requester: { accountId: "a" } });
+    await spawn(harness, { runId: "run-b1", sessionKey: DM_SESSION_KEY, requester: { accountId: "b" } });
+
+    assert.equal(webA.opens.length, 1);
+    assert.equal(webB.opens.length, 1);
+    assert.equal(webA.posts[0].channel, "DA");
+    assert.equal(webB.posts[0].channel, "DB");
+  });
+
+  it("constructs Slack clients with zero SDK retries and finite timeouts", () => {
+    const web = createBoundedSlackWebClient("xoxb-test");
+    assert.equal(web.retryConfig.retries, 0);
+    assert.equal(web.axios.defaults.timeout, 10_000);
+    assert.equal(web.rejectRateLimitedCalls, true);
+  });
+});
