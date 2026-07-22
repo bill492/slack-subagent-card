@@ -186,7 +186,11 @@ test("version mutation permits only package, lock, and manifest", () => {
   assert.doesNotThrow(() =>
     assertOnlyVersionFilesChanged(" M openclaw.plugin.json\n M package-lock.json\n M package.json\n"),
   );
+  assert.doesNotThrow(() =>
+    assertOnlyVersionFilesChanged("M openclaw.plugin.json\n M package-lock.json\n M package.json"),
+  );
   assert.throws(() => assertOnlyVersionFilesChanged(" M package.json\n M index.ts\n"), /unexpected files/);
+  assert.throws(() => assertOnlyVersionFilesChanged("not porcelain"), /invalid git porcelain record/);
 });
 
 test("resume state must match current package and repository identity", () => {

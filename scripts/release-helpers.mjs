@@ -298,7 +298,16 @@ export function parsePorcelainPaths(output) {
   return output
     .split("\n")
     .filter(Boolean)
-    .map((line) => line.slice(3).split(" -> ").at(-1));
+    .map((line) => {
+      // `output()` trims the complete command output, which removes the first
+      // status column when the first porcelain record is an unstaged change.
+      // Accept that one-column form as well as ordinary porcelain-v1 records.
+      const match = line.match(/^(?:[ MADRCUT?!]{2} |[MADRCUT?!] )(.+)$/);
+      if (!match) {
+        throw new Error(`invalid git porcelain record: ${line}`);
+      }
+      return match[1].split(" -> ").at(-1);
+    });
 }
 
 export function assertOnlyVersionFilesChanged(output) {
