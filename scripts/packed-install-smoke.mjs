@@ -125,7 +125,9 @@ export async function smokePackedInstall(options = {}) {
       OPENCLAW_CONFIG_PATH: configPath,
     };
 
-    run(openclawBin, ["plugins", "install", `npm-pack:${tarball}`, "--force"], {
+    // The reviewed local artifact is installed only into this disposable test
+    // state. Newer hosts require explicit consent for its existing hook capability.
+    run(openclawBin, ["plugins", "install", `npm-pack:${tarball}`, "--force", "--accept-capabilities"], {
       cwd: repoRoot,
       env,
       capture: true,
